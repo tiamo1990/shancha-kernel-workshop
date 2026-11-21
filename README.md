@@ -118,7 +118,7 @@ APK 信息：
 
 ## 下载
 
-- **安装包**：``release/shancha-提权-v6.9.apk`（正式版命名规范：`shancha-提权-vX.X`）
+- **安装包**：``release/shancha-提权-v6.4.apk`（正式版命名规范：`shancha-提权-vX.X`）
 - **Release 页**：[v5.5](https://github.com/tiamo1990/shancha-kernel-workshop/releases/tag/v5.5)（附件为 ASCII 别名 `shancha-v5.5.apk`，内容一致）
 - **源码**：[src/](src/)（载荷 `own137.c` + App Java 源码）
 - **历史研究记录**：[research/](research/)（项目报告、各阶段脚本、早期 `own127.c`）
@@ -140,5 +140,25 @@ APK 信息：
 
 ### 下载
 
-- 仓库内：`release/shancha-提权-v6.9.apk`
+- 仓库内：`release/shancha-提权-v6.4.apk`
 - Release 附件：`shancha-v6.9.apk`（ASCII 别名，字节一致）
+---
+
+## v6.4（versionCode 82）
+
+| 项 | 说明 |
+|---|---|
+| 日志位置 | 自动保存到 `下载/山茶内核工坊/日志/run-<时间>-<版本>.txt` |
+| 界面提示 | 日志卡标题右侧显示保存路径，并有「保存」按钮 |
+| 7879 启动方式 | 还原 2.9 原版：`rm -f .lock2 own127.lock` → `setsid … > own127.log 2>&1 < /dev/null &` → tail 日志 |
+| 驻留保护 | 识别 `parking without reap` 后拒绝中止/重复启动，提示重启 |
+| sha 校验 | 大小写归一，只有真正不一致才阻止 |
+| 误触保护 | 成功中止拒绝；重启需 4 秒内双击；超窗（>150 s）需二次确认 |
+| 卡住自动清理 | 未成功且 45 s 无输出 → 自动 `pkill own127` |
+
+### 日志查看方式
+
+1. App 内「实时回显」卡片
+2. 文件管理 → 下载 → **山茶内核工坊** → **日志**
+3. 点日志卡右上「保存」手动留一份
+4. 电脑：`adb pull /sdcard/Download/山茶内核工坊/日志/`
