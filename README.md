@@ -82,7 +82,7 @@ S6|装载|保活挂起|E6120|mark=1|ok=1
 ## 4. 仓库内容
 
 ```
-（安装包已移至 GitHub Releases，不再放在仓库内）
+`shancha-提权-v5.5.apk`（正式版命名规范：`shancha-提权-vX.X`）
 docs/RESEARCH.md                     研究记录：原语、常量核对、符号审计、时序分析
 docs/LOG_SCHEME.md                   日志语法规范与事件码表
 src/payload/own137.c                 载荷源码
@@ -118,6 +118,7 @@ APK 信息：
 
 ## 下载
 
-- **安装包（Release）**：[v5.5](https://github.com/tiamo1990/shancha-kernel-workshop/releases/tag/v5.5)
+- **安装包**：`release/shancha-提权-v5.5.apk`（正式版命名 `shancha-提权-vX.X`）
+- **Release 页**：[v5.5](https://github.com/tiamo1990/shancha-kernel-workshop/releases/tag/v5.5)（附件为 ASCII 别名 `shancha-v5.5.apk`，内容一致）
 - **源码**：[src/](src/)（载荷 `own137.c` + App Java 源码）
 - **历史研究记录**：[research/](research/)（项目报告、各阶段脚本、早期 `own127.c`）
