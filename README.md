@@ -82,9 +82,13 @@ S6|装载|保活挂起|E6120|mark=1|ok=1
 ## 4. 仓库内容
 
 ```
-release/shancha-ownctl-v5.5-63.apk   App 安装包（研究用）
+（安装包已移至 GitHub Releases，不再放在仓库内）
 docs/RESEARCH.md                     研究记录：原语、常量核对、符号审计、时序分析
 docs/LOG_SCHEME.md                   日志语法规范与事件码表
+src/payload/own137.c                 载荷源码
+src/payload/ksyms_table.h            225 项内核符号表
+src/app/                             配套 App 源码（Java + Manifest）
+research/                            历史研究记录（报告、脚本、早期源码）
 ```
 
 APK 信息：
@@ -110,3 +114,10 @@ APK 信息：
 ## 6. 免责声明
 
 本项目为**内核安全研究**记录，用于理解定时器竞态、SLUB 页回收与内核模块装载链路。作者不对任何滥用、数据丢失或设备损坏负责。请在你拥有完全控制权的设备上使用。
+---
+
+## 下载
+
+- **安装包（Release）**：[v5.5](https://github.com/tiamo1990/shancha-kernel-workshop/releases/tag/v5.5)
+- **源码**：[src/](src/)（载荷 `own137.c` + App Java 源码）
+- **历史研究记录**：[research/](research/)（项目报告、各阶段脚本、早期 `own127.c`）
