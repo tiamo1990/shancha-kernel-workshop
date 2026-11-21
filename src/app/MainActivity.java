@@ -168,7 +168,22 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
 
         try {
             pressFx(findViewById(R.id.start));
-            pressFx(findViewById(R.id.stop));
+            bindVersionPicker();
+        recoverLastRun();
+        findViewById(R.id.logSave).setOnClickListener(new android.view.View.OnClickListener() {
+            public void onClick(android.view.View v) { bounce(v); exportLog(); }
+        });
+        findViewById(R.id.logSave).setOnLongClickListener(new android.view.View.OnLongClickListener() {
+            public boolean onLongClick(android.view.View v) { bounce(v); exportDiag(); return true; }
+        });
+        findViewById(R.id.copy).setOnLongClickListener(new android.view.View.OnLongClickListener() {
+            public boolean onLongClick(android.view.View v) {
+                bounce(v);
+                exportLog();
+                return true;
+            }
+        });
+        pressFx(findViewById(R.id.stop));
             pressFx(findViewById(R.id.copy));
         } catch (Throwable ignored) { }
         try {
@@ -205,6 +220,10 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         findViewById(R.id.stop).setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 bounce(v);
+                if (successDeclared || sawSuccess || moduleLoaded() || parkedZombie) {
+                    emit("已接管/已驻留 · 中止会释放持有的页并可能触发内核崩溃，已拒绝", 0);
+                    return;
+                }
                 try {
                     if (Shizuku.pingBinder()) {
                         IShizukuService s2 = IShizukuService.Stub.asInterface(
@@ -587,7 +606,26 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
     }
 
     /** 重启：优先走 Shizuku 的 shell 身份，其次 su。 */
+    private long rebootArmedAt;
+    private long forceRunAt;
+    private long lateArmedAt;
+
+    private long preWarnAt;
+    static final String LOG_DIR = "/sdcard/Download/山茶内核工坊/日志";
+    private volatile boolean parkedZombie;
+    private IShizukuService svcRef;
+
     private void reboot() {
+        // 已接管内核时：需要 4 秒内点第二次才真正重启，避免误触丢掉提权
+        if (successDeclared || sawSuccess || moduleLoaded()) {
+            long now = System.currentTimeMillis();
+            if (now - rebootArmedAt > 4000) {
+                rebootArmedAt = now;
+                emit("已接管内核 · 重启会丢掉本次提权 —— 4 秒内再点一次「重启手机」即确认", 0);
+                return;
+            }
+            emit("已确认 · 正在重启设备", 1);
+        }
         emit("§ 请求重启系统", 0);
         new Thread(new Runnable() {
             public void run() {
@@ -819,6 +857,7 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
     private boolean successDeclared;
     private volatile boolean sawSuccess;
     private volatile long lastLineAt;
+    private volatile boolean watchStop;
 
     /** 拿到 root 的第一时间关掉 panic_on_warn，避免内核 WARN 直接把机器重启。 */
     /** 拿到 root 第一时间关掉内核恐慌策略；逐级探测 su，并读回实际值。 */
@@ -826,6 +865,9 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
     private void declareSuccess() {
         if (successDeclared) return;
         successDeclared = true;
+        getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                .putString("last_ok_ver", verChoice())
+                .putBoolean("ran_boot_ok", true).apply();
         ui.post(new Runnable() {
             public void run() {
                 try {
@@ -834,6 +876,10 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                 } catch (Throwable ignored) { }
                 emit("════════════════════════", 1);
                 emit("✅ 提权成功 · 已获得 root（KernelSU 已接管内核）", 1);
+                String[] bp = boundPayload();
+                long up2 = uptimeSec();
+                emit("版本 " + verChoice() + " · 载荷 sha " + (bp == null ? "?" : bp[1].substring(0, 12) + "…")
+                        + (up2 > 0 ? " · 开机 " + up2 + " 秒" : ""), 1);
                 emit("════════════════════════", 1);
                 emit("· 结束 · 链路已保活驻留（无需再点启动）", 1);
                 running = false;                 // 允许界面回到可用状态
@@ -885,6 +931,8 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                                         rp.getInputStream())));
                 String v = r.readLine();
                 rp.waitFor();
+                try { r.close(); } catch (Throwable ignored) { }
+                try { rp.destroy(); } catch (Throwable ignored) { }
                 if (v != null && v.trim().equals("0")) {
                     emit("已关闭内核恐慌策略（panic_on_warn=0 via Shizuku+su）", 1);
                     return true;
@@ -912,12 +960,39 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         return false;
     }
 
+    /** 7879 槽位用的是 2.9 原版载荷，它的日志是方括号标签格式，单独解析。 */
+    private boolean legacyLog() {
+        return "7879".equals(verChoice());
+    }
+
+    /** 7879 走 2.9 原版载荷：原样输出，只按关键词着色，不做改写。 */
+    private void narrateLegacy(String l) {
+        if (l.contains("parking without reap") || l.contains("no verified slide")
+                || l.contains("do not kill this process")) {
+            parkedZombie = true;
+            emit(l, 0);
+            emit("· 老链路已进入僵尸驻留（持有页）—— 不要中止、不要杀进程，请重启设备", 0);
+            return;
+        }
+        boolean bad = l.contains("failed") || l.contains("FAILED")
+                || l.contains("ok=0") || l.contains("errno=-");
+        if (l.contains("gate127") && l.contains("SUCCESS")) sawSuccess = true;
+        emit(l, bad ? 0 : 1);
+    }
+
     private void narrate(String raw) {
         String l = raw == null ? "" : raw.trim();
         if (l.isEmpty()) return;
 
         // 自研语法：S<n>|段名|动作|事件码|k=v…   与 D|… 调试通道
+        synchronized (liveBuf) { liveBuf.append(l).append('\n'); }
+        flushLive();
+        if (legacyLog()) { narrateLegacy(l); return; }
         if (l.startsWith("D|")) return;
+        if (sawSuccess && l.contains("E6121")) {
+            emit("· 保活已结束（收到信号）", 0);
+            return;
+        }
         if (l.contains("E6081") && sawSuccess && !successDeclared) {
             emit("· 收尾 · 链路已自行收束（E6081）", 0);
             declareSuccess();
@@ -1124,6 +1199,10 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
 
     /** 统一日志出口：先记账（hist/raw），再交给 UI 线程绘制。 */
     private void emit(final String rawLine, final int kind) {
+        try {
+            synchronized (liveBuf) { liveBuf.append(rawLine == null ? "" : rawLine).append('\n'); }
+            flushLive();
+        } catch (Throwable ignored) { }
         if (log == null) return;
         final String line = rawLine == null ? "" : rawLine.replaceAll("^[ \\t]+", "");
         if (line.isEmpty()) return;
@@ -1224,20 +1303,579 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         if (breathe != null) { breathe.cancel(); stage.setAlpha(1f); breathe = null; }
     }
 
+    /** 官方内置两支载荷：3666（新内核）/ 7879（旧内核）。必选。 */
+    /** 版本 → 资产名 / 体积 / sha256 —— 运行前逐字节校验，保证"选哪个就跑哪个"。 */
+    static final String[][] VER_SHA = {
+            {"3666", "own127",      "532280", "8038F24F0A39E7628ED8CBD4AD26FA658D99ECA762CFD411AA1610AF11A083C5"},
+            {"7879", "own127_prev", "527672", "EA78013468BD0C8FCCF5CEDB030A08D9162D450757288EE5CAC15185B75B43D2"},
+    };
+
+    private java.util.List<String[]> manifestList;
+
+    /** 运行时清单（外置优先），元素 {id,asset,size,sha,label,kernel}。 */
+    private java.util.List<String[]> manifest() {
+        if (manifestList == null) {
+            manifestList = Payloads.loadManifest(this);
+            if (manifestList == null) {
+                java.util.List<String[]> fb = new java.util.ArrayList<>();
+                for (String[] r : VER_SHA)
+                    fb.add(new String[] { r[0], r[1], r[2], r[3],
+                            r[0].equals("7879") ? "7879 · 旧内核" : "3666 · 新内核",
+                            r[0].equals("7879") ? "6.6.127 / abogki…7879" : "6.6.127 / abogki573773666" });
+                manifestList = fb;
+            }
+        }
+        return manifestList;
+    }
+
+    static final String[][] VER = {
+            {"3666", "3666 · 新内核", "6.6.127 / abogki573773666"},
+            {"7879", "7879 · 旧内核", "6.6.127 / abogki...7879"},
+    };
+
+    private String verChoice() {
+        return getSharedPreferences("ownctl", MODE_PRIVATE).getString("payload_ver", "");
+    }
+
+    private void bindVersionPicker() {
+        final TextView pick = findViewById(R.id.verPick);
+        if (pick == null) return;
+        refreshVerLabel(pick);
+        pick.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                bounce(v);
+                showVersionMenu(pick);
+            }
+        });
+    }
+
+    private void refreshVerLabel(TextView pick) {
+        String c = verChoice();
+        if (c.isEmpty()) {
+            pick.setText("请选择 · 3666（新内核） / 7879（旧内核）");
+        } else {
+            for (String[] r : VER)
+                if (r[0].equals(c)) pick.setText("已选 · " + r[1]);
+        }
+    }
+
+    private void showVersionMenu(final TextView anchor) {
+        final android.app.Dialog dlg = new android.app.Dialog(this);
+        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+
+        final android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        box.setBackgroundResource(R.drawable.menu_bg);
+        int pad = (int) (12 * getResources().getDisplayMetrics().density);
+        box.setPadding(pad, pad, pad, pad);
+
+        android.widget.TextView head = new android.widget.TextView(this);
+        head.setText("选择链路版本");
+        head.setTextSize(12f);
+        head.setTextColor(0xFF7C8B84);
+        head.setPadding(pad / 2, pad / 3, pad / 2, pad / 2);
+        box.addView(head);
+
+        String cur = verChoice();
+        String lastOk = getSharedPreferences("ownctl", MODE_PRIVATE).getString("last_ok_ver", "");
+        for (final String[] row : manifest()) {
+            android.widget.LinearLayout item = new android.widget.LinearLayout(this);
+            item.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            item.setGravity(android.view.Gravity.CENTER_VERTICAL);
+            item.setBackgroundResource(row[0].equals(cur)
+                    ? R.drawable.menu_item_sel : R.drawable.menu_item_bg);
+            int ip = (int) (14 * getResources().getDisplayMetrics().density);
+            item.setPadding(ip, ip, ip, ip);
+
+            android.widget.ImageView dot = new android.widget.ImageView(this);
+            dot.setImageResource(row[0].equals(cur) ? R.drawable.dot_on : R.drawable.dot_off);
+            android.widget.LinearLayout.LayoutParams dlp = new android.widget.LinearLayout.LayoutParams(
+                    (int) (10 * getResources().getDisplayMetrics().density),
+                    (int) (10 * getResources().getDisplayMetrics().density));
+            dlp.rightMargin = ip / 2;
+            item.addView(dot, dlp);
+
+            android.widget.LinearLayout texts = new android.widget.LinearLayout(this);
+            texts.setOrientation(android.widget.LinearLayout.VERTICAL);
+            TextView t1 = new TextView(this);
+            t1.setText(row[4] + (row[0].equals(lastOk) ? "  ✓ 上次成功" : ""));
+            t1.setTextSize(15f);
+            t1.setTextColor(0xFF22302B);
+            TextView t2 = new TextView(this);
+            t2.setText(row[5]);
+            t2.setTextSize(11f);
+            t2.setTextColor(0xFF8CA096);
+            texts.addView(t1);
+            texts.addView(t2);
+            item.addView(texts, new android.widget.LinearLayout.LayoutParams(
+                    0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+            item.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                            .putString("payload_ver", row[0]).apply();
+                    refreshVerLabel(anchor);
+                    emit("链路版本已选定 · " + row[4] + "（" + row[5] + "）", 1);
+                    dlg.dismiss();
+                }
+            });
+            android.widget.LinearLayout.LayoutParams ilp = new android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+            ilp.topMargin = ip / 4;
+            ilp.bottomMargin = ip / 4;
+            box.addView(item, ilp);
+        }
+
+        dlg.setContentView(box);
+        android.view.Window w = dlg.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
+            w.setLayout(android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+            w.setGravity(android.view.Gravity.CENTER);
+            w.getAttributes().windowAnimations = 0;
+        }
+        dlg.show();
+    }
+
+    /** 返回 {资产名, sha256, 体积}；未选择返回 null。 */
+    private String[] boundPayload() {
+        String c = verChoice();
+        if (c.isEmpty()) return null;
+        for (String[] r : manifest())
+            if (r[0].equals(c)) return new String[] { r[1], r[3], r[2] };
+        return null;
+    }
+
+    /** 把链路日志保存到 Download/山茶内核工坊/日志，返回可见路径（失败返回 null）。 */
+    // ---- 实时日志：固定文件持续覆盖，重启后仍能在目录里找回 ----
+    private static final String LIVE_NAME = "实时日志-最近一次.txt";
+    private final StringBuilder liveBuf = new StringBuilder();
+    private android.net.Uri liveUri;
+    private long sessionId = -1;
+    private String sessionStart = "";
+    private String sessionVer = "";
+    private volatile long lastLiveFlush;
+
+    private android.net.Uri ensureLiveUri() {
+        if (liveUri != null) return liveUri;
+        try {
+            String rel = android.os.Environment.DIRECTORY_DOWNLOADS + "/山茶内核工坊/日志";
+            android.net.Uri col = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+            android.database.Cursor c = getContentResolver().query(col,
+                    new String[]{android.provider.MediaStore.MediaColumns._ID},
+                    android.provider.MediaStore.MediaColumns.DISPLAY_NAME + "=? AND "
+                            + android.provider.MediaStore.MediaColumns.RELATIVE_PATH + "=?",
+                    new String[]{LIVE_NAME, rel + "/"}, null);
+            if (c != null) {
+                if (c.moveToFirst()) {
+                    long id = c.getLong(0);
+                    c.close();
+                    liveUri = android.content.ContentUris.withAppendedId(col, id);
+                    return liveUri;
+                }
+                c.close();
+            }
+            android.content.ContentValues cv = new android.content.ContentValues();
+            cv.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, LIVE_NAME);
+            cv.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+            cv.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel);
+            liveUri = getContentResolver().insert(col, cv);
+        } catch (Throwable ignored) { }
+        return liveUri;
+    }
+
+    /** 新一轮开始：建一个“进行中”的独立文件。 */
+    private void startSession() {
+        try {
+            sessionVer = verChoice().isEmpty() ? "unknown" : verChoice();
+            sessionStart = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss",
+                    java.util.Locale.US).format(new java.util.Date());
+            String name = "进行中-" + sessionStart + "-" + sessionVer + ".txt";
+            String rel = android.os.Environment.DIRECTORY_DOWNLOADS + "/山茶内核工坊/日志";
+            android.content.ContentValues cv = new android.content.ContentValues();
+            cv.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+            cv.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+            cv.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel);
+            liveUri = getContentResolver().insert(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            if (liveUri != null) {
+                sessionId = android.content.ContentUris.parseId(liveUri);
+                getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                        .putLong("session_id", sessionId)
+                        .putString("session_start", sessionStart)
+                        .putString("session_ver", sessionVer).apply();
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** 结束本轮：把“进行中”改名为「时间_版本_结果」。 */
+    private String finishSession(String outcome) {
+        try {
+            long id = sessionId;
+            String st = sessionStart, ver = sessionVer;
+            if (id <= 0 || st.isEmpty()) {
+                id = getSharedPreferences("ownctl", MODE_PRIVATE).getLong("session_id", -1);
+                st = getSharedPreferences("ownctl", MODE_PRIVATE).getString("session_start", "");
+                ver = getSharedPreferences("ownctl", MODE_PRIVATE).getString("session_ver", "unknown");
+            }
+            if (id <= 0) return null;
+            String niceStart = st.length() >= 15
+                    ? st.substring(0, 4) + "-" + st.substring(4, 6) + "-" + st.substring(6, 8)
+                      + "_" + st.substring(9, 11) + "-" + st.substring(11, 13) + "-" + st.substring(13, 15)
+                    : st;
+            String name = niceStart + "_" + ver + "_" + outcome + ".txt";
+            android.content.ContentValues cv = new android.content.ContentValues();
+            cv.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+            android.net.Uri u = android.content.ContentUris.withAppendedId(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, id);
+            int n = getContentResolver().update(u, cv, null, null);
+            liveUri = null; sessionId = -1;
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putLong("session_id", -1).apply();
+            if (n > 0) return "/sdcard/Download/山茶内核工坊/日志/" + name;
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    /** 覆盖写入实时日志（每 1 秒刷新）。 */
+    private void flushLive() {
+        long now = System.currentTimeMillis();
+        if (now - lastLiveFlush < 1000) return;
+        lastLiveFlush = now;
+        final String body;
+        synchronized (liveBuf) { body = liveBuf.toString(); }
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    android.net.Uri u = ensureLiveUri();
+                    if (u == null) return;
+                    java.io.OutputStream os = getContentResolver().openOutputStream(u, "wt");
+                    if (os == null) return;
+                    String head = "# 山茶 · 内核工坊 实时日志（每 1 秒刷新）\n"
+                            + "# 版本 " + verChoice() + " · "
+                            + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
+                                    java.util.Locale.US).format(new java.util.Date()) + "\n"
+                            + "# ---- 链路输出 ----\n";
+                    os.write(head.getBytes("UTF-8"));
+                    os.write(body.getBytes("UTF-8"));
+                    os.flush();
+                    os.close();
+                } catch (Throwable ignored) { }
+            }
+        }).start();
+    }
+
+    private String saveLog(String tag) {
+        try {
+            if (!Shizuku.pingBinder()) return null;
+            IShizukuService svc0 = IShizukuService.Stub.asInterface(
+                    new ShizukuBinderWrapper(Shizuku.getBinder()));
+            String src = "7879".equals(verChoice())
+                    ? "/data/local/tmp/own127.log" : "/data/local/tmp/cve-2026-98260.log";
+
+            // 1) 通过 shell 读出日志正文（避免 app 无权限读 /data/local/tmp）
+            IRemoteProcess rp0 = svc0.newProcess(new String[]{"sh", "-c",
+                    "cat " + src + " 2>/dev/null | tail -c 400000"}, null, "/");
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            java.io.InputStream ins = new android.os.ParcelFileDescriptor.AutoCloseInputStream(
+                    rp0.getInputStream());
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = ins.read(buf)) > 0) bo.write(buf, 0, n);
+            ins.close();
+            rp0.waitFor();
+
+            String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss",
+                    java.util.Locale.US).format(new java.util.Date());
+            String name = "run-" + stamp + "-" + tag + ".txt";
+            String rel = android.os.Environment.DIRECTORY_DOWNLOADS + "/山茶内核工坊/日志";
+
+            StringBuilder head = new StringBuilder();
+            head.append("# 山茶 · 内核工坊 运行日志\n")
+                .append("# 版本 ").append(tag).append("\n")
+                .append("# 时间 ").append(new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
+                        java.util.Locale.US).format(new java.util.Date())).append("\n")
+                .append("# ---- 链路输出 ----\n");
+            byte[] body = bo.toByteArray();
+            byte[] hb = head.toString().getBytes("UTF-8");
+
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                // 2) 写入媒体库 Downloads（文件管理器/下载 App 立刻可见）
+                android.content.ContentValues cv = new android.content.ContentValues();
+                cv.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+                cv.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+                cv.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel);
+                android.net.Uri uri = getContentResolver().insert(
+                        android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                if (uri == null) return null;
+                java.io.OutputStream os = getContentResolver().openOutputStream(uri);
+                os.write(hb);
+                os.write(body);
+                os.flush();
+                os.close();
+                return "/sdcard/" + rel + "/" + name;
+            }
+
+            // 3) 旧系统：shell 直接写
+            String dst = "/sdcard/" + rel + "/" + name;
+            String cmd = "mkdir -p '/sdcard/" + rel + "'"
+                    + "; { printf '%s' '" + head.toString().replace("'", "") + "'; cat " + src
+                    + " 2>/dev/null; } > '" + dst + "'"
+                    + "; am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file://" + dst
+                    + " >/dev/null 2>&1; ls '" + dst + "' >/dev/null 2>&1 && echo OK || echo FAIL";
+            IRemoteProcess rp1 = svc0.newProcess(new String[]{"sh", "-c", cmd}, null, "/");
+            java.io.BufferedReader r1 = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(
+                            new android.os.ParcelFileDescriptor.AutoCloseInputStream(
+                                    rp1.getInputStream())));
+            String v = r1.readLine();
+            rp1.waitFor();
+            return (v != null && v.contains("OK")) ? dst : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 导出诊断包（长按「保存」）：内核串 + 关键符号 + 最近日志，方便远程定位常量漂移。 */
+    private void exportDiag() {
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    if (!Shizuku.pingBinder()) { emit("诊断导出失败：Shizuku 未就绪", 0); return; }
+                    IShizukuService svc0 = IShizukuService.Stub.asInterface(
+                            new ShizukuBinderWrapper(Shizuku.getBinder()));
+                    String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss",
+                            java.util.Locale.US).format(new java.util.Date());
+                    String name = "诊断-" + stamp + ".txt";
+                    java.io.File f = new java.io.File(getCacheDir(), name);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("# 山茶诊断包\n");
+                    sb.append("# 生成 ").append(stamp).append("\n");
+                    sb.append("# App 版本 ").append(verChoice()).append("\n");
+                    sb.append("# 内核 ").append(Payloads.uname()).append("\n\n");
+                    sb.append("[符号地址]\n").append(shellText(svc0,
+                            "grep -E ' (prepare_creds|do_timer_create|capable|load_module|trace_module_notify)$' /proc/kallsyms 2>/dev/null | head -20"));
+                    sb.append("\n[kmem 事件]\n").append(shellText(svc0,
+                            "cat /sys/kernel/tracing/events/kmem/kmem_cache_alloc/enable 2>/dev/null; "
+                          + "mkdir -p /sys/kernel/tracing 2>/dev/null; ls /sys/kernel/tracing/events/kmem 2>/dev/null | head"));
+                    sb.append("\n[最近链路日志]\n").append(shellText(svc0,
+                            "tail -c 120000 /data/local/tmp/cve-2026-98260.log 2>/dev/null; "
+                          + "tail -c 80000 /data/local/tmp/own127.log 2>/dev/null"));
+                    java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
+                    fo.write(sb.toString().getBytes("UTF-8"));
+                    fo.close();
+
+                    String rel = android.os.Environment.DIRECTORY_DOWNLOADS + "/山茶内核工坊/日志";
+                    android.content.ContentValues cv = new android.content.ContentValues();
+                    cv.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+                    cv.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+                    cv.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel);
+                    android.net.Uri u = getContentResolver().insert(
+                            android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                    if (u == null) { emit("诊断导出失败：无法写入下载目录", 0); return; }
+                    java.io.OutputStream os = getContentResolver().openOutputStream(u);
+                    java.io.FileInputStream fi = new java.io.FileInputStream(f);
+                    byte[] b = new byte[8192]; int n;
+                    while ((n = fi.read(b)) > 0) os.write(b, 0, n);
+                    fi.close(); os.flush(); os.close();
+                    emit("诊断包已保存 · /sdcard/" + rel + "/" + name, 1);
+                } catch (Throwable t) {
+                    emit("诊断导出异常：" + t.getClass().getSimpleName(), 0);
+                }
+            }
+        }).start();
+    }
+
+    /** 以 shell 身份执行并取回文本（最多 64KB）。 */
+    private String shellText(IShizukuService svc, String cmd) {
+        try {
+            IRemoteProcess rp = svc.newProcess(new String[]{"sh", "-c", cmd}, null, "/");
+            java.io.InputStream in = new android.os.ParcelFileDescriptor.AutoCloseInputStream(
+                    rp.getInputStream());
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] b = new byte[8192]; int n, total = 0;
+            while ((n = in.read(b)) > 0 && total < 65536) { bo.write(b, 0, n); total += n; }
+            in.close(); rp.waitFor();
+            return bo.toString("UTF-8");
+        } catch (Throwable t) {
+            return "(读取失败: " + t.getClass().getSimpleName() + ")\n";
+        }
+    }
+
+    /** 手动导出（长按「复制」）。 */
+    private void exportLog() {
+        new Thread(new Runnable() {
+            public void run() {
+                String p = saveLog(verChoice().isEmpty() ? "unknown" : verChoice());
+                if (p != null) emit("日志已保存 · " + p, 1);
+                else emit("日志保存失败（Shizuku 未就绪或目录不可写）", 0);
+            }
+        }).start();
+    }
+
+    /** 严格按 2.9 原版的启动与观察方式（逐字对齐其命令序列）。 */
+    private void legacyStart(IShizukuService svc, String which, String wantSha) throws Exception {
+        // 1) 环境准备（与 2.9 完全一致：预建日志 666、tmp 777）
+        String prep = "mkdir -p /data/local/tmp"
+                + "; [ -f /data/local/tmp/cve-2026-98260.log ] || : > /data/local/tmp/cve-2026-98260.log"
+                + "; chmod 666 /data/local/tmp/cve-2026-98260.log 2>/dev/null"
+                + "; chmod 777 /data/local/tmp 2>/dev/null"
+                + "; chmod 755 /data/local/tmp/own127"
+                + "; rm -f /data/local/tmp/.lock2 /data/local/tmp/own127.lock 2>/dev/null"
+                + "; ls -l /data/local/tmp/cve-2026-98260.log /data/local/tmp/own127 2>&1";
+        IRemoteProcess rp0 = svc.newProcess(new String[]{"sh", "-c", prep}, null, "/data/local/tmp");
+        rp0.waitFor();
+
+        // 2) 起跑（与 2.9 完全一致）
+        String run = "cd /data/local/tmp"
+                + "; rm -rf /data/local/tmp/chan"
+                + "; mkdir -p /data/local/tmp/chan"
+                + "; chmod 777 /data/local/tmp/chan"
+                + "; rm -f /data/local/tmp/ksu_slide.txt"
+                + "; setsid /data/local/tmp/own127 fake nofix > /data/local/tmp/own127.log 2>&1 < /dev/null &"
+                + " echo started";
+        IRemoteProcess rp1 = svc.newProcess(new String[]{"sh", "-c", run}, null, "/data/local/tmp");
+        rp1.waitFor();
+        emit("已按 2.9 原版方式启动（setsid 后台 · 日志 own127.log）", 1);
+
+        // 3) 观察（2.9 用 wc -c 判增量；这里用 tail -c +偏移，等价且更省）
+        long off = 0;
+        long t0 = System.currentTimeMillis();
+        while (System.currentTimeMillis() - t0 < 240000L) {
+            try { Thread.sleep(800); } catch (InterruptedException ignored) { }
+            IRemoteProcess rd = svc.newProcess(new String[]{"sh", "-c",
+                    "wc -c < /data/local/tmp/own127.log 2>/dev/null"}, null, "/");
+            java.io.BufferedReader rb = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(
+                            new android.os.ParcelFileDescriptor.AutoCloseInputStream(rd.getInputStream())));
+            String szs = rb.readLine();
+            rb.close();
+            rd.waitFor();
+            long sz = 0;
+            try { sz = Long.parseLong(szs == null ? "0" : szs.trim()); } catch (Throwable ignored) { }
+            if (sz > off) {
+                IRemoteProcess rc = svc.newProcess(new String[]{"sh", "-c",
+                        "tail -c +" + (off + 1) + " /data/local/tmp/own127.log 2>/dev/null"}, null, "/");
+                java.io.BufferedReader r2 = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(
+                                new android.os.ParcelFileDescriptor.AutoCloseInputStream(rc.getInputStream())));
+                String ln;
+                while ((ln = r2.readLine()) != null) {
+                    String l = ln.trim();
+                    if (l.isEmpty()) continue;
+                    lastLineAt = System.currentTimeMillis();
+                    narrate(l);
+                }
+                r2.close();
+                rc.waitFor();
+                off = sz;
+            }
+            if (sawSuccess || parkedZombie) break;
+        }
+        emit("· 2.9 原版观察窗结束", 0);
+    }
+
+    private String grab(String blob, String key) {
+        for (String ln : blob.split("\n")) {
+            String t = ln.trim();
+            if (t.startsWith(key + "=")) return t.substring(key.length() + 1).trim();
+        }
+        return "?";
+    }
+
+    private boolean preflight(IShizukuService svc) {
+        boolean ok = true;
+        try {
+            String info = shellText(svc,
+                    "echo KM=$(cat /sys/kernel/tracing/events/kmem/kmem_cache_alloc/enable 2>/dev/null);"
+                  + " echo LOCK=$(ls /data/local/tmp/.lock2 /data/local/tmp/own127.lock 2>/dev/null | wc -l);"
+                  + " echo PROC=$(pidof own127 | wc -w);"
+                  + " echo MOD=$(grep -c kernelsu /proc/modules)");
+            emit("· 预检 · kmem=" + grab(info, "KM") + " 残留锁=" + grab(info, "LOCK")
+                    + " 旧进程=" + grab(info, "PROC") + " 模块=" + grab(info, "MOD"), 0);
+            if (!"1".equals(grab(info, "KM")))
+                emit("· 提示 · kmem 事件当前未开启（载荷运行时会自行开启，不影响启动）", 0);
+            if (!"0".equals(grab(info, "LOCK")) || !"0".equals(grab(info, "PROC"))) {
+                emit("⚠ 检测到上一轮残留（锁/进程）—— 建议先重启，否则会报 another instance holds the lock", 0);
+                ok = false;
+            }
+        } catch (Throwable ignored) { }
+        return ok;
+    }
+
+    private void recoverLastRun() {
+        new Thread(new Runnable() {
+            public void run() {
+                try { Thread.sleep(2600); } catch (InterruptedException ignored) { }
+                try {
+                    boolean pending = getSharedPreferences("ownctl", MODE_PRIVATE).getBoolean("run_pending", false);
+                    if (!pending) return;
+                    String ver = getSharedPreferences("ownctl", MODE_PRIVATE).getString("run_pending_ver", "unknown");
+                    String renamed = finishSession("重启");
+                    String p2 = saveLog(ver + "-重启前");
+                    emit("上次运行因重启结束 · 已补存日志" + (renamed != null ? "（" + renamed + "）" : ""), 1);
+                    getSharedPreferences("ownctl", MODE_PRIVATE).edit().putBoolean("run_pending", false).apply();
+                } catch (Throwable ignored) { }
+            }
+        }).start();
+    }
+
     private void start() {
         if (running) { emit("§ 链路已在运行", 0); return; }
         long up = uptimeSec();
         long bid = bootId();                       /* 0 = 开机时长未知 */
         long lastBoot = getSharedPreferences("ownctl", MODE_PRIVATE).getLong("ran_boot", 0);
-        if (bid != 0 && lastBoot == bid) {
-            emit("本次开机已跑过一轮；kprobe/窗口已消耗，请点底部「重启手机」后再试", 0);
-            return;
+        boolean lastOk = getSharedPreferences("ownctl", MODE_PRIVATE)
+                .getBoolean("ran_boot_ok", false);
+        if (bid != 0 && lastBoot == bid && lastOk) {
+            long nowF = System.currentTimeMillis();
+            if (nowF - forceRunAt > 3000) {
+                forceRunAt = nowF;
+                emit("本机这次开机已经成功接管过一次；再跑一轮风险很高（内核已打补丁）", 0);
+                emit("—— 3 秒内再点一次「启动链路」可强行继续，否则请点「重启手机」重开窗口", 0);
+                running = false;
+                return;
+            }
+            emit("已确认强行再跑一轮（风险自负）", 0);
         }
         if (bid != 0) getSharedPreferences("ownctl", MODE_PRIVATE).edit()
                 .putLong("ran_boot", bid).apply();
+        if (verChoice().isEmpty()) {
+            emit("请先在上方「链路版本」选择 3666 或 7879 —— 选错版本会在凭据阶段失败", 0);
+            running = false;
+            return;
+        }
+        if (parkedZombie) {
+            emit("上次老链路已僵尸驻留（持有页）—— 请先重启设备，再开新一轮", 0);
+            running = false;
+            return;
+        }
+        {
+            String relNow = Payloads.uname();
+            String vcNow = verChoice();
+            boolean fit = (vcNow.equals("3666")
+                        && (relNow.contains("573773666") || relNow.contains("gd489d4ad2a70")))
+                       || (vcNow.equals("7879")
+                        && (relNow.contains("7879") || relNow.contains("567717946")));
+            if (!fit)
+                emit("⚠ 当前内核与所选版本不一致：内核 " + relNow + " · 已选 " + vcNow
+                        + " —— 已放行，继续按你的选择执行", 0);
+        }
         if (up < 0) {
             /* 开机时长读不到：显示“未知”，不打印 -1，也不拦链路 */
             emit("开机时长未知 · 窗口状态未知；若本轮失败，请点底部「重启手机」后立刻重试", 0);
+        } else if (up > 150) {
+            long nowL = System.currentTimeMillis();
+            if (nowL - lateArmedAt > 3000) {
+                lateArmedAt = nowL;
+                emit("⚠ 本次开机已 " + up + " 秒，远超有效窗口（90 秒内）——这一轮几乎必然失败", 0);
+                emit("—— 3 秒内再点一次「启动链路」仍要强行尝试，否则请点「重启手机」", 0);
+                running = false;
+                return;
+            }
+            emit("已确认在超窗状态下强行尝试（失败风险高）", 0);
         } else if (up > 90) {
             emit("⚠ 本次开机已 " + up + " 秒，利用窗口通常只在开机 90 秒内有效", 0);
             emit("⚠ 建议先点底部「重启手机」，开机后立刻再启动", 0);
@@ -1249,7 +1887,25 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         boolean suOk = hasSu();
         if (!shizukuOk && !suOk) { sayShizukuState(); return; }
         emit(shizukuOk ? "身份：Shizuku shell" : "身份：su（回退通道）", 0);
+        if (shizukuOk) {
+            try {
+                IShizukuService svcPre = IShizukuService.Stub.asInterface(
+                        new ShizukuBinderWrapper(Shizuku.getBinder()));
+                if (!preflight(svcPre)) {
+                    long nowP = System.currentTimeMillis();
+                    if (nowP - preWarnAt > 3000) {
+                        preWarnAt = nowP;
+                        emit("—— 3 秒内再点一次「启动链路」可在警告状态下强行继续，否则请先重启设备", 0);
+                        running = false;
+                        return;
+                    }
+                    emit("已确认在警告状态下强行继续", 0);
+                }
+            } catch (Throwable ignored) { }
+        }
         running = true;
+        synchronized (liveBuf) { liveBuf.setLength(0); }
+        startSession();
         getSharedPreferences("ownctl", MODE_PRIVATE).edit().putInt("attempt", 0).apply();
         for (int i = 0; i < 6; i++) pills[i].setBackgroundResource(R.drawable.pill_off);
         stageIdx = 0;
@@ -1277,10 +1933,16 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
 
     private void runViaShizuku() throws Exception {
         String rel = Payloads.uname();
-        String[] pick = Payloads.pick(rel);
-        String which = pick[0];
+        String[] bound = boundPayload();
+        if (bound == null) {
+            emit("未选择链路版本 · 请先在上方选择 3666 或 7879", 0);
+            return;
+        }
+        String which = bound[0];
+        String wantSha = bound[1];
         emit("内核 " + rel, 0);
-        emit("链路选择 " + which + "（" + pick[1] + "）", 0);
+        emit("链路版本 " + verChoice() + " → 内置资产 " + which
+                + "（" + bound[2] + " B · sha " + wantSha.substring(0, 12) + "…）", 1);
 
         File ko = new File(getFilesDir(), "kernelsu_patched.ko");
         unpack("kernelsu_patched.ko", ko);
@@ -1295,13 +1957,16 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
 
         // shell 读不到 app 私有目录，必须用 Shizuku 进程的 stdin 灌进 /data/local/tmp
         svc = IShizukuService.Stub.asInterface(new ShizukuBinderWrapper(Shizuku.getBinder()));
+        svcRef = svc;
         /* 只比字节数会漏判：527672 与 527672 完全可能是两支不同的载荷。旧版就因此
            一直“跳过灌注”，实际跑的是 /data/local/tmp 里那份陈旧文件，换了打包的
            载荷也不生效。现在按 尺寸+md5 判断是否真的已就位。 */
-        if (!sameRemote(svc, "/data/local/tmp/own127", which))
+        if ("7879".equals(verChoice()) || !sameRemote(svc, "/data/local/tmp/own127", which)) {
             pushAsset(svc, which, "/data/local/tmp/own127", "755");
-        else
+            emit("链路载荷已写入（7879 强制覆盖，与 2.9 的 cp -f 一致）", 0);
+        } else {
             emit("链路已就位 · 跳过灌注", 0);
+        }
         if (!sameRemote(svc, "/data/local/tmp/kernelsu_patched.ko", "kernelsu_patched.ko"))
             pushAsset(svc, "kernelsu_patched.ko", "/data/local/tmp/kernelsu_patched.ko", "644");
         else
@@ -1310,10 +1975,29 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         /* 与手工可用形态逐字一致：cd 进目录、重建 chan、清两个残留文件、直接跑载荷。
            不再追加 2>&1 / 前置探针命令 / 不同 cwd —— 这些都会改变载荷看到的 stdio 与
            fd 布局，而手工成功时跑的就是下面这一条。 */
+        if ("7879".equals(verChoice())) {
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putBoolean("run_pending", true)
+                    .putString("run_pending_ver", verChoice()).apply();
+            emit("以 shell 身份启动链路（2.9 原版方式 · nofix）", 0);
+            legacyStart(svc, which, wantSha);
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putBoolean("run_pending", false).apply();
+            String sp = saveLog("7879");
+            emit(sp != null ? "日志已保存 · " + sp : "日志保存失败", sp != null ? 1 : 0);
+            return;
+        }
         String cmd = "cd /data/local/tmp && rm -rf chan && mkdir -p chan"
                 + " && chmod 777 chan && rm -f .lock2 ksu_slide.txt"
+                + " && H=$(sha256sum ./own127 2>/dev/null | cut -d' ' -f1 | tr 'A-Z' 'a-z')"
+                + " && W=" + wantSha.toLowerCase(java.util.Locale.US) + " && if [ \"$H\" != \"$W\" ]; then"
+                + " echo \"· 载荷校验失败 · got=${H:-none} want=" + wantSha.substring(0, 12) + "… · 已阻止执行\"; exit 9; fi"
+                + " && echo \"· 载荷校验通过 · sha=" + wantSha.substring(0, 12) + "… · 版本 " + verChoice() + "\""
                 + " && ./own127 fake nofix";
 
+        getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                .putBoolean("run_pending", true)
+                .putString("run_pending_ver", verChoice()).apply();
         emit("以 shell 身份启动链路（nofix）", 0);
         rp = svc.newProcess(new String[]{"sh", "-c", cmd}, null, "/data/local/tmp");
         drainErr(rp);
@@ -1325,11 +2009,20 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             public void run() {
                 while (true) {
                     try { Thread.sleep(5000); } catch (InterruptedException ignored) { return; }
+                    if (watchStop) return;
                     if (sawSuccess) return;          // 已成功：进入保活，绝不能杀
                     long idle = System.currentTimeMillis() - lastLineAt;
                     if (idle > 45000) {
-                        emit("· 卡住 · 已 " + (idle / 1000) + " 秒无输出，自动中止本次链路", 0);
+                        emit("· 卡住 · 已 " + (idle / 1000) + " 秒无输出 —— 清理本次链路进程", 0);
                         try { rpWatch.destroy(); } catch (Throwable ignored) { }
+                        // 未成功 = 还没拿到页，此时杀掉是安全的；成功路径在上面已 return
+                        try {
+                            if (svcRef != null) {
+                                IRemoteProcess k = svcRef.newProcess(
+                                        new String[]{"sh", "-c", "pkill -f own127"}, null, "/");
+                                k.waitFor();
+                            }
+                        } catch (Throwable ignored) { }
                         return;
                     }
                 }
@@ -1341,10 +2034,22 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             lastLineAt = System.currentTimeMillis();
             narrate(line);
         }
+        watchStop = true;
         int rc = rp.waitFor();
         emit("· 收尾 · 链路进程已退出（code=" + rc + "）", 0);
+        {
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putBoolean("run_pending", false).apply();
+            String sp2 = saveLog(verChoice());
+            emit(sp2 != null ? "日志已保存 · " + sp2 : "日志保存失败", sp2 != null ? 1 : 0);
+        }
         if (sawSuccess && !successDeclared) declareSuccess();
-        else emit("· 结束 · 本次未接管内核", 0);   // 全部跑完才显示成功
+        else emit("· 结束 · 本次未接管内核", 0);
+        {
+            String fin = finishSession(parkedZombie ? "驻留"
+                    : (sawSuccess ? "成功" : ("失败-code" + rc)));
+            emit(fin != null ? "本轮日志文件 · " + fin : "本轮日志改名失败", fin != null ? 1 : 0);
+        }   // 全部跑完才显示成功
         emit("§ 链路退出 code=" + rc, 0);
         boolean live = false;
         for (int i = 0; i < 20 && !live; i++) {
@@ -1407,7 +2112,9 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
 
     private void runViaSu() throws Exception {
         String rel = Payloads.uname();
-        String[] pick = Payloads.pick(rel);
+        String[] bound = boundPayload();
+        if (bound == null) { emit("未选择链路版本 · 请先在上方选择 3666 或 7879", 0); return; }
+        String[] pick = new String[] { bound[0], "用户选定 " + verChoice() };
         File ko = new File(getFilesDir(), "kernelsu_patched.ko");
         unpack("kernelsu_patched.ko", ko);
         File bin = new File(getApplicationInfo().nativeLibraryDir,

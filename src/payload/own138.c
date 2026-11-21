@@ -2647,9 +2647,16 @@ static uint64_t leak_cred(pid_t *out_pid, int *out_go, int *out_st,
 				 * attempt 1..3 只会白耗时间并在 kprobe 上留垃圾。
 				 * 记一条 E3031，然后由下面既有的完整清理收尾并
 				 * 跳出循环（不新增任何 kill 语义）。 */
-				zj_emit(3, 0, "凭据未命中", "E3031",
-					"attempt=%d|child=%d|recs=%d|ok=0", attempt, p, c);
-				nomatch = 1;
+				if (attempt >= 2) {
+					/* 连续 3 轮都没命中才判定本次失败（原先第 1 轮就停，
+					 * 会把一次偶然丢帧当成结论——7946 反馈即由此而来）。 */
+					zj_emit(3, 0, "凭据未命中", "E3031",
+						"attempt=%d|child=%d|recs=%d|ok=0", attempt, p, c);
+					nomatch = 1;
+				} else {
+					zj_emit(3, 1, "重试", "E3032",
+						"attempt=%d|recs=%d|ok=1", attempt, c);
+				}
 			}
 		}
 		if (R) {

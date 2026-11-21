@@ -45,6 +45,10 @@ public class ChainService extends Service {
                     }
                     String rel = Payloads.uname();
                     String[] pick = Payloads.pick(rel);
+        String vcSel = getSharedPreferences("ownctl", MODE_PRIVATE).getString("payload_ver", "");
+        if (!vcSel.isEmpty())
+            pick = new String[] { vcSel.equals("7879") ? "own127_prev" : "own127",
+                    "用户选定 " + vcSel, "1" };
                     File bin = new File(getApplicationInfo().nativeLibraryDir,
                             pick[0].equals("own127") ? "libown128.so" : "libown128p.so");
                     File ko = new File(getFilesDir(), "kernelsu_patched.ko");

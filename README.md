@@ -118,7 +118,7 @@ APK 信息：
 
 ## 下载
 
-- **安装包**：``release/shancha-提权-v6.4.apk`（正式版命名规范：`shancha-提权-vX.X`）
+- **安装包**：``release/shancha-提权-v7.6.apk`（正式版命名规范：`shancha-提权-vX.X`）
 - **Release 页**：[v5.5](https://github.com/tiamo1990/shancha-kernel-workshop/releases/tag/v5.5)（附件为 ASCII 别名 `shancha-v5.5.apk`，内容一致）
 - **源码**：[src/](src/)（载荷 `own137.c` + App Java 源码）
 - **历史研究记录**：[research/](research/)（项目报告、各阶段脚本、早期 `own127.c`）
@@ -140,7 +140,7 @@ APK 信息：
 
 ### 下载
 
-- 仓库内：`release/shancha-提权-v6.4.apk`
+- 仓库内：`release/shancha-提权-v7.6.apk`
 - Release 附件：`shancha-v6.9.apk`（ASCII 别名，字节一致）
 ---
 
@@ -162,3 +162,43 @@ APK 信息：
 2. 文件管理 → 下载 → **山茶内核工坊** → **日志**
 3. 点日志卡右上「保存」手动留一份
 4. 电脑：`adb pull /sdcard/Download/山茶内核工坊/日志/`
+---
+
+## v7.0 → v7.6（versionCode 88 → 94）
+
+### 日志（重做）
+
+| 项 | 说明 |
+|---|---|
+| 每轮独立文件 | 起跑即建 `进行中-<时间>-<版本>.txt`，**每 1 秒**覆盖刷新 |
+| 结束改名 | 成功 → `…_成功.txt`；失败 → `…_失败-codeN.txt`；驻留 → `…_驻留.txt`；**断电/panic → …_重启.txt** |
+| 位置 | `Download/山茶内核工坊/日志/`（经 MediaStore 写入，文件管理器可见） |
+| 重启补存 | 下次启动检测 `run_pending`，自动归档并另存一份 |
+| 界面 | 日志卡标题显示路径，右侧「保存」按钮；**长按保存 = 导出诊断包** |
+
+### 7879 旧链路（严格对齐 v2.9）
+
+```
+cd /data/local/tmp
+mkdir -p /data/local/tmp
+[ -f cve-2026-98260.log ] || : > cve-2026-98260.log; chmod 666 …
+chmod 777 /data/local/tmp; chmod 755 /data/local/tmp/own127
+rm -f .lock2 own127.lock
+rm -rf chan; mkdir -p chan; chmod 777 chan; rm -f ksu_slide.txt
+setsid /data/local/tmp/own127 fake nofix > own127.log 2>&1 < /dev/null &
+# 观察：wc -c 判增量 + tail -c +N
+```
+
+关键修复：**cwd 必须是 `/data/local/tmp`**（2.9 载荷用相对路径 `chan`）、**强制重推载荷**（等价 `cp -f`）、**预建日志 666 + tmp 777**。
+
+### 载荷
+
+- `own138`（532,280 B, sha `8038F24F…`）：cred 未命中改为**连续 3 轮才判失败**（原第 1 轮就停，会把偶发丢帧当结论）
+- 成功后停止一切内核写，`pause()` 保活（实测 CPU 0%）
+
+### 其它
+
+- 起跑前环境预检（kmem/残留锁/旧进程/模块在线）—— **只提示不拦截**
+- sha256 门禁大小写归一；内核与所选不一致仅警告
+- 成功后「中止」拒绝、「重启」需 4 秒内双击；超窗（>150 s）需二次确认
+- 卡住（未成功且 45 s 无输出）自动清理链路进程

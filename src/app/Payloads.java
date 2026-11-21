@@ -4,16 +4,14 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 
 /**
- * 按内核版本挑链路二进制。
+ * 按内核版本挑选链路载荷。
  *
- * 两支载荷各对应一代内核，必须都在包里、运行时按 uname -r 选：
- *   - 17.2.14.x/15.x（构建号后缀 573773666 / 3666）→ own127      （自有载荷）
- *   - 老一代（构建号后缀 7879 / 567717946）        → own127_prev （历史载荷, EA7801…，v2.9 成功过那支）
- * 拿错代际必然卡在 cred（offset 对不上），所以这里先用构建号精确匹配，再按代际回落。
+ * 原则：**永不阻断**。精确命中就用对应那一支；没命中就按内核代际回落，
+ * 仍然继续尝试（只是把"未精确匹配"的提示打给用户）。
  */
 final class Payloads {
 
-    /** 内核特征串 → 链路资产名。顺序有意义：先精确构建号，再宽泛特征。 */
+    /** 内核特征 -> 资产名。顺序有意义：先精确构建号，再宽泛特征。 */
     private static final String[][] MAP = {
             // 新内核：17.2.14.x / 17.2.15.x（gd489d4ad2a70，cred 站点 0xe5770）
             {"573773666", "own127"},
@@ -22,6 +20,33 @@ final class Payloads {
             {"7879", "own127_prev"},
             {"567717946", "own127_prev"},
     };
+
+    /** 读 assets/payloads.json：{id,asset,size,sha256,label,kernel}；失败返回 null。 */
+    static java.util.List<String[]> loadManifest(android.content.Context c) {
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        try {
+            java.io.InputStream is = c.getAssets().open("payloads.json");
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) > 0) bo.write(buf, 0, n);
+            is.close();
+            org.json.JSONObject root = new org.json.JSONObject(bo.toString("UTF-8"));
+            org.json.JSONArray arr = root.getJSONArray("payloads");
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject o = arr.getJSONObject(i);
+                out.add(new String[] {
+                        o.getString("id"), o.getString("asset"),
+                        String.valueOf(o.optLong("size")),
+                        o.getString("sha256"),
+                        o.optString("label", o.getString("id")),
+                        o.optString("kernel", "") });
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        return out.isEmpty() ? null : out;
+    }
 
     static String uname() {
         try {
@@ -36,16 +61,15 @@ final class Payloads {
         }
     }
 
-    /** 返回 {资产名, 选择理由}。 */
+    /** 返回 {资产名, 理由, 是否精确命中("1"/"0")}。 */
     static String[] pick(String release) {
         if (release == null || release.isEmpty())
-            return new String[] { "own127", "内核版本读不到，优先用新内核链路" };
+            return new String[] { "own127", "内核版本读不到 · 按新内核链路尝试", "0" };
         for (String[] row : MAP)
             if (release.contains(row[0]))
-                return new String[] { row[1], "命中内核特征 " + row[0] };
-        // 没命中具体构建号：按代际回落，新链路优先
+                return new String[] { row[1], "命中内核特征 " + row[0], "1" };
         if (release.contains("6.6.12") || release.compareTo("6.6.120") >= 0)
-            return new String[] { "own127", "按代际回落（6.6.12x 及以上）→ 新内核链路" };
-        return new String[] { "own127_prev", "按代际回落到老内核链路" };
+            return new String[] { "own127", "未精确匹配 · 按代际回落到新内核链路", "0" };
+        return new String[] { "own127_prev", "未精确匹配 · 按代际回落到老内核链路", "0" };
     }
 }

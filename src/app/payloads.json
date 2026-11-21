@@ -3,8 +3,8 @@
     {
       "id": "3666",
       "asset": "own127",
-      "size": 532216,
-      "sha256": "EA79A8ED3EAD0DB8BF9B448AA1A2E33C89CB7D3C99C740942F5B3C5FF0B86175",
+      "size": 532280,
+      "sha256": "8038F24F0A39E7628ED8CBD4AD26FA658D99ECA762CFD411AA1610AF11A083C5",
       "label": "3666 · 新内核",
       "kernel": "6.6.127 / abogki573773666"
     },
