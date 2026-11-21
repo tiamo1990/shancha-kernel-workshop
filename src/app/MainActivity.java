@@ -220,22 +220,39 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         findViewById(R.id.stop).setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 bounce(v);
-                if (successDeclared || sawSuccess || moduleLoaded() || parkedZombie) {
+                /* P1-9：成功后 / 已接管 / 已驻留一律拒绝中止（杀驻留进程会放掉持有的页）。
+                   命中缓存先拒绝，没命中再后台复核一次，不在主线程做阻塞 IPC。 */
+                if (successDeclared || sawSuccess || parkedZombie || stateTaken) {
                     emit("已接管/已驻留 · 中止会释放持有的页并可能触发内核崩溃，已拒绝", 0);
                     return;
                 }
-                try {
-                    if (Shizuku.pingBinder()) {
-                        IShizukuService s2 = IShizukuService.Stub.asInterface(
-                                new ShizukuBinderWrapper(Shizuku.getBinder()));
-                        s2.newProcess(new String[]{"sh", "-c",
-                                "pkill -f 'own127 fake' ; pkill -f own127"}, null, "/").waitFor();
+                new Thread(new Runnable() {
+                    public void run() {
+                        boolean mod = false;
+                        try { mod = moduleLoaded(); } catch (Throwable ignored) { }
+                        if (mod) {
+                            stateTaken = true;
+                            startLocked = true;
+                            ui.post(new Runnable() { public void run() {
+                                try { applyUiTaken("模块 kernelsu 在线 · 中止已拒绝"); } catch (Throwable ignored) { }
+                                emit("已接管内核 · 中止会释放持有的页并可能触发内核崩溃，已拒绝", 0);
+                            }});
+                            return;
+                        }
+                        try {
+                            if (Shizuku.pingBinder()
+                                    && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                                svcRef = IShizukuService.Stub.asInterface(
+                                        new ShizukuBinderWrapper(Shizuku.getBinder()));
+                                /* 按 PID 清理，不用 pkill -f（会自匹配到本命令的 sh -c） */
+                                killChainIfSafe();
+                            }
+                        } catch (Throwable t) {
+                            emit("中止失败：" + t.getClass().getSimpleName(), 0);
+                        }
+                        ui.post(new Runnable() { public void run() { stop(); } });
                     }
-                } catch (Throwable t) {
-                    emit("中止失败：" + t.getClass().getSimpleName(), 0);
-                }
-                // stop() 负责销毁 rp / 复位呼吸动画；原先它被重复注册的监听器覆盖，永远执行不到。
-                stop();
+                }).start();
             }
         });
         findViewById(R.id.copy).setOnClickListener(new View.OnClickListener() {
@@ -253,6 +270,27 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         });
 
         installCrashGuard();
+        /* P0-1：冷启动就把真实运行态回填进界面（异步，不阻塞主线程） */
+        refreshRealState();
+        /* 自检通道：外部可 `am start --ez probe_fgs true` 验证前台服务 type 合法，
+           只拉起 ChainService 的 probe 分支，绝不执行载荷链路。 */
+        try {
+            if (getIntent() != null && getIntent().getBooleanExtra("probe_fgs", false)) {
+                getIntent().removeExtra("probe_fgs");
+                android.content.Intent si = new android.content.Intent(this, ChainService.class);
+                si.putExtra("probe", true);
+                if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(si);
+                else startService(si);
+                emit("· 自检 · 已拉起前台服务 probe 分支（不执行载荷）", 0);
+            }
+        } catch (Throwable ignored) { }
+        try {
+            if (getIntent() != null && getIntent().getBooleanExtra("probe_log", false)) {
+                getIntent().removeExtra("probe_log");
+                emit("· 自检 · 开始日志链路自检（不执行载荷）", 0);
+                selfTestLog();
+            }
+        } catch (Throwable ignored) { }
         if (android.os.Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission("android.permission.POST_NOTIFICATIONS")
                    != PackageManager.PERMISSION_GRANTED)
@@ -277,8 +315,19 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        /* P0-1：每次回到前台都按真实状态回填一次（模块/进程都可能在这期间变化） */
+        try { refreshRealState(); } catch (Throwable ignored) { }
+    }
+
+    @Override
     protected void onDestroy() {
         Shizuku.removeRequestPermissionResultListener(this);
+        try { if (breathe != null) breathe.cancel(); } catch (Throwable ignored) { }
+        /* 用户直接划掉 App：仍在跑且未成功 → 按失败路径清理，避免留下空占资源的 7879 进程。
+           已成功/已驻留/已接管 一律不碰（killChainIfSafe 内部还有一道拒绝）。 */
+        try { cleanupOnLeave(); } catch (Throwable ignored) { }
         super.onDestroy();
     }
 
@@ -303,6 +352,8 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
             public void uncaughtException(Thread t, Throwable e) {
+                /* 任何未捕获异常都不许让「运行中」这个门闩卡在 true（P0-3） */
+                try { running = false; } catch (Throwable ignored) { }
                 try {
                     java.io.FileWriter w = new java.io.FileWriter(
                             new java.io.File(getFilesDir(), "last_crash.txt"), false);
@@ -390,6 +441,9 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             if (scroll != null) scroll.setBackgroundColor(0x00000000);
             refreshPills();
             refreshBadge();
+            /* recolor() 会把 start 的字色刷回白色；锁着的时候必须再把灰态盖回去，
+               否则白字压在灰胶囊上看不见，就像按钮“被挡住” */
+            if (startLocked) lockStartButton("已锁定");
         } catch (Throwable ignored) { }
     }
 
@@ -435,7 +489,7 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         boolean dark = darkMode();
         try {
             if (stageIdx >= 7) {
-                badge.setText("在线");
+                badge.setText(stateTaken ? "已接管" : "在线");
                 badge.setBackgroundResource(R.drawable.pill_on);
                 badge.setTextColor(0xFFFFFFFF);
             } else {
@@ -613,7 +667,18 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
     private long preWarnAt;
     static final String LOG_DIR = "/sdcard/Download/山茶内核工坊/日志";
     private volatile boolean parkedZombie;
+    private volatile boolean legacyFailed;
     private IShizukuService svcRef;
+
+    /* ---- 真实运行态（P0-1）：moduleLoaded() 的缓存，避免主线程做阻塞 IPC ---- */
+    /** 已确认真实状态（至少回填过一次）。 */
+    private volatile boolean stateChecked;
+    /** 模块 kernelsu 在 /proc/modules 里 = 已接管。 */
+    private volatile boolean stateTaken;
+    /** 「启动链路」是否已锁死（已接管 / 已驻留 / 本次开机已跑过一轮）。 */
+    private volatile boolean startLocked;
+    /** 本次开机是否已经点过启动（持久化在 prefs，杀进程/重建实例都不解锁）。 */
+    private volatile boolean runLocked;
 
     private void reboot() {
         // 已接管内核时：需要 4 秒内点第二次才真正重启，避免误触丢掉提权
@@ -696,6 +761,238 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             p2.waitFor();
             return v != null && !v.trim().equals("0") && !v.trim().isEmpty();
         } catch (Throwable t) { return false; }
+    }
+
+    // ================= P0-1 真实运行态回填 =================
+
+    /**
+     * 用两个真实判据回填界面：
+     *   ① moduleLoaded()  —— /proc/modules 里有没有 kernelsu（读失败退 Shizuku）
+     *   ② pidof own127    —— 有没有驻留进程
+     * 两者都在工作线程里做，结果回主线程上屏。
+     */
+    private void refreshRealState() {
+        new Thread(new Runnable() {
+            public void run() {
+                boolean mod = false, alive = false;
+                try { mod = moduleLoaded(); } catch (Throwable ignored) { }
+                if (!mod) {
+                    try { alive = remoteAlive(); } catch (Throwable ignored) { }
+                }
+                final boolean fm = mod, fa = alive;
+                ui.post(new Runnable() {
+                    public void run() {
+                        try {
+                            stateChecked = true;
+                            stateTaken = fm;
+                            if (running) return;      /* 正在跑：绝不覆盖实时界面 */
+                            if (fm) applyUiTaken("模块 kernelsu 已在 /proc/modules 中 · 内核已接管，无需再启动");
+                            else if (fa || loadParked())
+                                applyUiParked("上次链路仍驻留（pidof own127 / 已落盘状态）· 请重启设备，不要重跑");
+                            else applyUiIdle();
+                        } catch (Throwable ignored) { }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** 已接管：徽标「已接管」、标题「已接管 · 无需再启动」、进度 6/6、启动按钮置灰并锁死。 */
+    private void applyUiTaken(final String why) {
+        startLocked = true;
+        stageIdx = 7;
+        try {
+            if (badge != null) {
+                badge.setText("已接管");
+                badge.setBackgroundResource(R.drawable.pill_on);
+                badge.setTextColor(0xFFFFFFFF);
+            }
+            if (stage != null) stage.setText("已接管 · 无需再启动");
+            if (progress != null) progress.setText("进度 6 / 6");
+            if (hint != null) hint.setText(why);
+            int[] ids = {R.id.p1, R.id.p2, R.id.p3, R.id.p4, R.id.p5, R.id.p6};
+            for (int i = 0; i < ids.length; i++) {
+                View v = findViewById(ids[i]);
+                if (v != null) v.setBackgroundResource(R.drawable.pill_on);
+            }
+            lockStartButton("已接管 · 无需启动");
+        } catch (Throwable ignored) { }
+    }
+
+    /** 有驻留进程但模块不在：拒绝重跑，明确要求重启。 */
+    private void applyUiParked(final String why) {
+        parkedZombie = true;
+        startLocked = true;
+        try {
+            if (badge != null) {
+                badge.setText("已驻留");
+                badge.setBackgroundResource(R.drawable.pill_off);
+                badge.setTextColor(0xFFD8623A);
+            }
+            if (stage != null) stage.setText("上次链路仍驻留 · 请重启设备");
+            if (hint != null) hint.setText(why);
+            lockStartButton("驻留中 · 需重启");
+        } catch (Throwable ignored) { }
+    }
+
+    /** 两者都没有：正常待机。只有本轮没跑过才允许再点启动。 */
+    private void applyUiIdle() {
+        if (successDeclared || sawSuccess) return;
+        try {
+            badge.setText(runLocked ? "已启动过" : "待机");
+            badge.setBackgroundResource(darkMode() ? R.drawable.pill_dark : R.drawable.pill_off);
+            badge.setTextColor(darkMode() ? 0xFFA9BACC : 0xFF7387A0);
+            stage.setText(runLocked ? "本次开机已启动过一轮" : "链路待机");
+            if (hint != null)
+                hint.setText(runLocked
+                        ? "为避免重复往内核写，本次开机内不再允许启动；要重开请点底部「重启手机」"
+                        : "自检 → 标定 → 定位 → 回收 → 落位 → 装载");
+            if (runLocked) {
+                startLocked = true;
+                lockStartButton("本次开机已跑过");
+            } else {
+                startLocked = false;
+                unlockStartButton();
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** 把「启动链路」置灰：实心灰胶囊 + 灰字。
+     *  注意：绝不能 animate().cancel() —— 入场动画是 translationY 12f→0，
+     *  掐在半路会让按钮永久停在下方（看起来就是「往下移动、没对齐」）。
+     *  这里只换背景与字色，不动位移/缩放/透明度。 */
+    private void lockStartButton(String label) {
+        try {
+            final View b = findViewById(R.id.start);
+            if (b == null) return;
+            b.setBackgroundResource(R.drawable.pill_disabled);
+            if (b instanceof TextView) ((TextView) b).setTextColor(0xFF8FA39A);
+            b.setEnabled(true);
+            ui.postDelayed(new Runnable() {
+                public void run() {
+                    try {
+                        if (startLocked && !running) {
+                            b.setBackgroundResource(R.drawable.pill_disabled);
+                            if (b instanceof TextView) ((TextView) b).setTextColor(0xFF8FA39A);
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            }, 1200);
+        } catch (Throwable ignored) { }
+    }
+
+    /** 恢复「启动链路」到可点状态（绿胶囊 + 白字）。 */
+    private void unlockStartButton() {
+        try {
+            View b = findViewById(R.id.start);
+            if (b == null) return;
+            b.setBackgroundResource(R.drawable.pill_on);
+            if (b instanceof TextView) ((TextView) b).setTextColor(0xFFFFFFFF);
+            b.setAlpha(1f);
+            b.setTranslationY(0f);
+            b.setScaleX(1f);
+            b.setScaleY(1f);
+        } catch (Throwable ignored) { }
+    }
+
+    /** 载荷进程是否驻留：优先 Shizuku，其次本机 sh（/proc 允许读时）。 */
+    private boolean remoteAlive() {
+        try {
+            if (Shizuku.pingBinder()
+                    && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                IShizukuService s2 = IShizukuService.Stub.asInterface(
+                        new ShizukuBinderWrapper(Shizuku.getBinder()));
+                IRemoteProcess p2 = s2.newProcess(new String[]{"sh", "-c",
+                        "pidof own127 2>/dev/null | wc -w"}, null, "/");
+                InputStream is = new android.os.ParcelFileDescriptor.AutoCloseInputStream(
+                        p2.getInputStream());
+                java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(is));
+                String v = r.readLine();
+                r.close();
+                p2.waitFor();
+                String t = v == null ? "" : v.trim();
+                if (!t.isEmpty() && !t.equals("0")) return true;
+            }
+        } catch (Throwable ignored) { }
+        try {
+            Process p = Runtime.getRuntime().exec(
+                    new String[]{"/system/bin/sh", "-c", "pidof own127 2>/dev/null"});
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()));
+            String v = r.readLine();
+            r.close();
+            p.waitFor();
+            return v != null && !v.trim().isEmpty();
+        } catch (Throwable t) { return false; }
+    }
+
+    /** 只提示：KernelSU 管理器是否安装 / 版本（2.9 会检查；这里不自动安装）。 */
+    private String ksuManagerInfo() {
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo("me.weishu.kernelsu", 0);
+            return "已安装 · 版本 " + (pi.versionName == null ? "?" : pi.versionName)
+                    + " (" + pi.versionCode + ")";
+        } catch (Throwable t) { return null; }
+    }
+
+    /** 本次开机是否已点过启动（落盘，杀进程/重建实例都不解锁）。 */
+    private boolean loadRunLock() {
+        try {
+            long bid = bootId();
+            if (bid == 0) return false;
+            return getSharedPreferences("ownctl", MODE_PRIVATE)
+                    .getBoolean("run_locked", false)
+                    && getSharedPreferences("ownctl", MODE_PRIVATE).getLong("run_locked_boot", 0) == bid;
+        } catch (Throwable t) { return false; }
+    }
+
+    private void saveRunLock() {
+        try {
+            long bid = bootId();
+            runLocked = true;
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putBoolean("run_locked", true)
+                    .putLong("run_locked_boot", bid).apply();
+        } catch (Throwable ignored) { }
+    }
+
+    /** 开机门闩：只有「同一次开机且已成功过」才允许拦，其余一律放行重试。 */
+    private void markBootResult(boolean ok) {
+        try {
+            long bid = bootId();
+            android.content.SharedPreferences.Editor e =
+                    getSharedPreferences("ownctl", MODE_PRIVATE).edit();
+            if (bid != 0) e.putLong("ran_boot", bid);
+            e.putBoolean("ran_boot_ok", ok).apply();
+        } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 日志链路自检（不执行任何载荷）：建会话文件 → 追加几行链路格式的文本 → 改名收尾。
+     * 只用来验证「追加写不会留全 0 文件」「进行中会被改名」两件事，外部用
+     * `am start --ez probe_log true` 触发。
+     */
+    private void selfTestLog() {
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    startSession();
+                    emit("· 自检 · 会话文件已建立（不执行载荷）", 0);
+                    for (int i = 1; i <= 3; i++) {
+                        narrate("S1|自检|自检行" + i + "|E000" + i + "|ok=1|probe=1");
+                        try { Thread.sleep(1100); } catch (InterruptedException ignored) { }
+                    }
+                    narrate("S6|装载|自检收尾|E6080|ok=1|probe=1");
+                    try { Thread.sleep(1200); } catch (InterruptedException ignored) { }
+                    String fin = finishSession("自检-无载荷");
+                    emit(fin != null ? "· 自检 · 会话已收尾改名 → " + fin : "· 自检 · 改名失败", fin != null ? 1 : 0);
+                } catch (Throwable t) {
+                    emit("· 自检失败：" + t, 0);
+                }
+            }
+        }).start();
     }
 
     /** 提权成功后直接打开本机 KernelSU。 */
@@ -865,14 +1162,16 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
     private void declareSuccess() {
         if (successDeclared) return;
         successDeclared = true;
+        stateTaken = true;
+        startLocked = true;
         getSharedPreferences("ownctl", MODE_PRIVATE).edit()
-                .putString("last_ok_ver", verChoice())
-                .putBoolean("ran_boot_ok", true).apply();
+                .putString("last_ok_ver", verChoice()).apply();
+        markBootResult(true);          /* 只有真成功才把本次开机标成 ok */
         ui.post(new Runnable() {
             public void run() {
                 try {
-                    TextView b = findViewById(R.id.badge);
-                    if (b != null) b.setText("已接管");
+                    /* 徽标/标题/进度/六段一次性置成「已接管」，并把启动按钮锁死 */
+                    applyUiTaken("链路已接管内核 · 已驻留保活，无需再点启动");
                 } catch (Throwable ignored) { }
                 emit("════════════════════════", 1);
                 emit("✅ 提权成功 · 已获得 root（KernelSU 已接管内核）", 1);
@@ -895,6 +1194,14 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                     try { Thread.sleep(800); } catch (InterruptedException ignored) { }
                 }
                 emit("提权已完成 · 需要时请自行打开 KernelSU", 1);
+            }
+        }).start();
+        /* 成功收尾：等 1.5s 让收尾行先被读到，再走统一 endRun。
+           killIfFailed=false —— 成功路径绝不碰进程（pause 驻留，杀了 UAF）。 */
+        new Thread(new Runnable() {
+            public void run() {
+                try { Thread.sleep(1500); } catch (InterruptedException ignored) { }
+                endRun("成功", verChoice().isEmpty() ? "unknown" : verChoice(), -1, false);
             }
         }).start();
     }
@@ -967,6 +1274,9 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
 
     /** 7879 走 2.9 原版载荷：原样输出，只按关键词着色，不做改写。 */
     private void narrateLegacy(String l) {
+        // 2.9 的判定：日志出现 "[gate127] SUCCESS" 即成功；"[gate127] done ok=0" 为失败标记
+        if (l.contains("[gate127] SUCCESS")) sawSuccess = true;
+        if (l.contains("[gate127] done ok=0")) legacyFailed = true;
         if (l.contains("parking without reap") || l.contains("no verified slide")
                 || l.contains("do not kill this process")) {
             parkedZombie = true;
@@ -985,7 +1295,15 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         if (l.isEmpty()) return;
 
         // 自研语法：S<n>|段名|动作|事件码|k=v…   与 D|… 调试通道
-        synchronized (liveBuf) { liveBuf.append(l).append('\n'); }
+        synchronized (liveBuf) {
+            liveBuf.append(l).append('\n');
+            /* 长跑（7879 观察窗 300s）时给缓冲设上限，超了裁头并同步已写偏移 */
+            if (liveBuf.length() > 524288) {
+                int cut = 262144;
+                liveBuf.delete(0, cut);
+                liveWritten = Math.max(0, liveWritten - cut);
+            }
+        }
         flushLive();
         if (legacyLog()) { narrateLegacy(l); return; }
         if (l.startsWith("D|")) return;
@@ -1199,10 +1517,8 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
 
     /** 统一日志出口：先记账（hist/raw），再交给 UI 线程绘制。 */
     private void emit(final String rawLine, final int kind) {
-        try {
-            synchronized (liveBuf) { liveBuf.append(rawLine == null ? "" : rawLine).append('\n'); }
-            flushLive();
-        } catch (Throwable ignored) { }
+        /* P1-7：emit 只负责界面与 hist/raw 记账，绝不写 liveBuf ——
+           实时日志文件只收链路输出（narrate/narrateLegacy），否则 UI 文案会把现场证据冲掉。 */
         if (log == null) return;
         final String line = rawLine == null ? "" : rawLine.replaceAll("^[ \\t]+", "");
         if (line.isEmpty()) return;
@@ -1486,8 +1802,13 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         return liveUri;
     }
 
-    /** 新一轮开始：建一个“进行中”的独立文件。 */
+    /** 新一轮开始：建一个“进行中”的独立文件，并立刻把 header 落盘（绝不留下 0 字节文件）。 */
     private void startSession() {
+        liveWritten = 0;
+        liveHeader = false;
+        lastLiveFlush = 0;
+        liveUri = null;
+        sessionId = -1;
         try {
             sessionVer = verChoice().isEmpty() ? "unknown" : verChoice();
             sessionStart = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss",
@@ -1500,14 +1821,23 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             cv.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, rel);
             liveUri = getContentResolver().insert(
                     android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
-            if (liveUri != null) {
-                sessionId = android.content.ContentUris.parseId(liveUri);
-                getSharedPreferences("ownctl", MODE_PRIVATE).edit()
-                        .putLong("session_id", sessionId)
-                        .putString("session_start", sessionStart)
-                        .putString("session_ver", sessionVer).apply();
-            }
+            if (liveUri != null) sessionId = android.content.ContentUris.parseId(liveUri);
         } catch (Throwable ignored) { }
+        /* 成败都要写 prefs：失败写 -1，避免 finishSession 去改上一轮的文件（P2-8） */
+        try {
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putLong("session_id", sessionId)
+                    .putString("session_start", sessionStart)
+                    .putString("session_ver", sessionVer).apply();
+        } catch (Throwable ignored) { }
+        if (sessionId > 0) {
+            /* header 必须抢在任何一行链路输出之前落盘，否则首行会跑到 header 前面。
+               这里同步写一次（一次小写入，与前面的 insert 同量级），写完再放开 flushLive。 */
+            liveHeader = true;
+            if (!appendLive("", true)) appendLive("", true);
+        } else {
+            liveHeader = false;
+        }
     }
 
     /** 结束本轮：把“进行中”改名为「时间_版本_结果」。 */
@@ -1531,40 +1861,79 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             android.net.Uri u = android.content.ContentUris.withAppendedId(
                     android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, id);
             int n = getContentResolver().update(u, cv, null, null);
-            liveUri = null; sessionId = -1;
-            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
-                    .putLong("session_id", -1).apply();
-            if (n > 0) return "/sdcard/Download/山茶内核工坊/日志/" + name;
+            if (n > 0) {
+                liveUri = null; sessionId = -1;
+                liveWritten = 0; liveHeader = false;
+                getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                        .putLong("session_id", -1).apply();
+                return "/sdcard/Download/山茶内核工坊/日志/" + name;
+            }
+            /* 改名失败：保留 prefs 里的 session 记录，下次启动由 recoverLastRun 再试一次（P2-10） */
         } catch (Throwable ignored) { }
         return null;
     }
 
-    /** 覆盖写入实时日志（每 1 秒刷新）。 */
+    /**
+     * 追加写入实时日志（每 1 秒一次，只写增量）。
+     *
+     * P1-5/P1-6 的根因是 "wt" 先截断再全量写：中途掉电就留下全 0x00 文件，
+     * 正常结束时又会把上一轮的现场覆盖掉。现在改成：
+     *   · "wa" 追加，永不截断 → 任何失败最多留半行，不会出现全 0 文件；
+     *   · 每个会话的第一笔先写 header（首行标记），后续只写增量；
+     *   · 写失败重试一次，仍失败也只丢这一块增量。
+     */
+    private int liveWritten;        /* 已写入文件的字符数（相对当前 liveBuf） */
+    private boolean liveHeader;     /* 本会话 header 是否已落盘 */
+
     private void flushLive() {
         long now = System.currentTimeMillis();
         if (now - lastLiveFlush < 1000) return;
         lastLiveFlush = now;
-        final String body;
-        synchronized (liveBuf) { body = liveBuf.toString(); }
+        final String delta;
+        final boolean needHead;
+        synchronized (liveBuf) {
+            int len = liveBuf.length();
+            if (len <= liveWritten) return;
+            delta = liveBuf.substring(liveWritten);
+            liveWritten = len;
+        }
+        needHead = !liveHeader;
+        liveHeader = true;
         new Thread(new Runnable() {
             public void run() {
-                try {
-                    android.net.Uri u = ensureLiveUri();
-                    if (u == null) return;
-                    java.io.OutputStream os = getContentResolver().openOutputStream(u, "wt");
-                    if (os == null) return;
-                    String head = "# 山茶 · 内核工坊 实时日志（每 1 秒刷新）\n"
-                            + "# 版本 " + verChoice() + " · "
-                            + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
-                                    java.util.Locale.US).format(new java.util.Date()) + "\n"
-                            + "# ---- 链路输出 ----\n";
-                    os.write(head.getBytes("UTF-8"));
-                    os.write(body.getBytes("UTF-8"));
-                    os.flush();
-                    os.close();
-                } catch (Throwable ignored) { }
+                if (appendLive(delta, needHead)) return;
+                /* 失败重试一次：只重发这一块增量 */
+                if (!appendLive(delta, needHead))
+                    android.util.Log.w("ownctl", "live append failed, dropped "
+                            + delta.length() + " chars");
             }
         }).start();
+    }
+
+    /** 追加一块增量（可选带 header）。返回是否成功。 */
+    private boolean appendLive(String delta, boolean withHead) {
+        try {
+            android.net.Uri u = ensureLiveUri();
+            if (u == null) return true;      /* 没有目标文件：不算失败，别反复重试 */
+            java.io.OutputStream os = null;
+            try { os = getContentResolver().openOutputStream(u, "wa"); } catch (Throwable ignored) { }
+            if (os == null) os = getContentResolver().openOutputStream(u);   /* 兜底：默认 rw */
+            if (os == null) return false;
+            if (withHead) {
+                String head = "# 山茶 · 内核工坊 实时日志（追加写 · 首行标记）\n"
+                        + "# HEADER append v8.0 · 版本 " + verChoice() + " · "
+                        + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
+                                java.util.Locale.US).format(new java.util.Date()) + "\n"
+                        + "# ---- 链路输出 ----\n";
+                os.write(head.getBytes("UTF-8"));
+            }
+            if (!delta.isEmpty()) os.write(delta.getBytes("UTF-8"));
+            os.flush();
+            try { os.close(); } catch (Throwable ignored) { }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private String saveLog(String tag) {
@@ -1715,9 +2084,9 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         }).start();
     }
 
-    /** 严格按 2.9 原版的启动与观察方式（逐字对齐其命令序列）。 */
-    private void legacyStart(IShizukuService svc, String which, String wantSha) throws Exception {
-        // 1) 环境准备（与 2.9 完全一致：预建日志 666、tmp 777）
+    /** 严格按 2.9 原版的启动与观察方式（逐字对齐其命令序列）。返回 false = 被 sha 门禁拦下。 */
+    private boolean legacyStart(IShizukuService svc, String which, String wantSha) throws Exception {
+        // 1) 环境准备 —— 与 2.9 逐字一致，一个字符都不加（含末尾的 ls -l）
         String prep = "mkdir -p /data/local/tmp"
                 + "; [ -f /data/local/tmp/cve-2026-98260.log ] || : > /data/local/tmp/cve-2026-98260.log"
                 + "; chmod 666 /data/local/tmp/cve-2026-98260.log 2>/dev/null"
@@ -1727,8 +2096,33 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                 + "; ls -l /data/local/tmp/cve-2026-98260.log /data/local/tmp/own127 2>&1";
         IRemoteProcess rp0 = svc.newProcess(new String[]{"sh", "-c", prep}, null, "/data/local/tmp");
         rp0.waitFor();
+        emit("· 2.9 原版 prep 已执行（含 rm -f .lock2 / own127.lock），链路序列未改动", 0);
 
-        // 2) 起跑（与 2.9 完全一致）
+        /* 1.5) P1-2 载荷 sha 门禁 —— 独立一条命令，跑在 setsid 之前，不进启动链、
+           不改启动链的 cwd/stdio/环境；不一致就根本不启动。 */
+        String want = wantSha == null ? "" : wantSha.trim().toLowerCase(java.util.Locale.US);
+        String wantShort = want.length() >= 12 ? want.substring(0, 12) + "…" : want;
+        String gate = "cd /data/local/tmp"
+                + "; H=$(sha256sum ./own127 2>/dev/null | cut -d' ' -f1 | tr 'A-Z' 'a-z')"
+                + "; W=" + want
+                + "; if [ -z \"$H\" ]; then echo \"GATE_FAIL got=none want=" + wantShort + "\"; exit 9; fi"
+                + "; if [ \"$H\" != \"$W\" ]; then echo \"GATE_FAIL got=${H} want=" + wantShort + "\"; exit 9; fi"
+                + "; echo \"GATE_OK sha=" + wantShort + "\"";
+        IRemoteProcess rpg = svc.newProcess(new String[]{"sh", "-c", gate}, null, "/data/local/tmp");
+        java.io.BufferedReader rg = new java.io.BufferedReader(new java.io.InputStreamReader(
+                new android.os.ParcelFileDescriptor.AutoCloseInputStream(rpg.getInputStream())));
+        String gv = rg.readLine();
+        try { rg.close(); } catch (Throwable ignored) { }
+        int grc = rpg.waitFor();
+        if (gv == null || !gv.contains("GATE_OK") || grc != 0) {
+            String got = gv == null ? "none" : gv.replace("GATE_FAIL ", "").trim();
+            /* 只报给界面，不往 own127.log 或任何链路文件里写东西 */
+            emit("· 载荷校验失败 · " + got + " · want=" + wantShort + " · 已阻止执行（exit 9），本轮不启动链路", 0);
+            return false;
+        }
+        emit("· 载荷校验通过（7879）· sha=" + wantShort, 1);
+
+        // 2) 起跑 —— 与 2.9 逐字一致
         String run = "cd /data/local/tmp"
                 + "; rm -rf /data/local/tmp/chan"
                 + "; mkdir -p /data/local/tmp/chan"
@@ -1743,7 +2137,8 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         // 3) 观察（2.9 用 wc -c 判增量；这里用 tail -c +偏移，等价且更省）
         long off = 0;
         long t0 = System.currentTimeMillis();
-        while (System.currentTimeMillis() - t0 < 240000L) {
+        /* 观察上限 300s（2.9 无明确上限，240s → 300s 只是放宽上限，不改间隔也不加提前退出） */
+        while (System.currentTimeMillis() - t0 < 300000L) {
             try { Thread.sleep(800); } catch (InterruptedException ignored) { }
             IRemoteProcess rd = svc.newProcess(new String[]{"sh", "-c",
                     "wc -c < /data/local/tmp/own127.log 2>/dev/null"}, null, "/");
@@ -1775,6 +2170,7 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             if (sawSuccess || parkedZombie) break;
         }
         emit("· 2.9 原版观察窗结束", 0);
+        return true;
     }
 
     private String grab(String blob, String key) {
@@ -1797,9 +2193,18 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                     + " 旧进程=" + grab(info, "PROC") + " 模块=" + grab(info, "MOD"), 0);
             if (!"1".equals(grab(info, "KM")))
                 emit("· 提示 · kmem 事件当前未开启（载荷运行时会自行开启，不影响启动）", 0);
-            if (!"0".equals(grab(info, "LOCK")) || !"0".equals(grab(info, "PROC"))) {
-                emit("⚠ 检测到上一轮残留（锁/进程）—— 建议先重启，否则会报 another instance holds the lock", 0);
-                ok = false;
+            boolean hasLock = !"0".equals(grab(info, "LOCK"));
+            boolean hasProc = !"0".equals(grab(info, "PROC"));
+            boolean modLoaded = "1".equals(grab(info, "MOD"));
+            if (hasLock || hasProc) {
+                if (!modLoaded) {
+                    shellText(svc, "rm -f /data/local/tmp/.lock2 /data/local/tmp/own127.lock 2>/dev/null; "
+                            + "pkill -f own127 2>/dev/null; echo done");
+                    emit("已自动清理上一轮残留（锁/进程）—— 上次是被重启打断的，属正常", 1);
+                } else {
+                    emit("⚠ 内核已接管且有残留进程，请先重启再跑", 0);
+                    ok = false;
+                }
             }
         } catch (Throwable ignored) { }
         return ok;
@@ -1822,13 +2227,40 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         }).start();
     }
 
+    /** 外层护栏：无论 startInner 在哪一步抛异常，running 都不会卡在 true。 */
     private void start() {
         if (running) { emit("§ 链路已在运行", 0); return; }
+        try {
+            startInner();
+        } catch (Throwable t) {
+            running = false;
+            stopBreathe();
+            emit("!! 启动失败 · 已复位运行标志：" + t, 0);
+        }
+    }
+
+    private void startInner() {
+        /* 7879 驻留状态落盘过：App 重启后仍然拦住（B 情形） */
+        runLocked = loadRunLock();
+        if (stateTaken) {
+            emit("已接管 · 无需再启动（内核已打补丁，重复跑会 panic）", 0);
+            return;
+        }
+        if (loadParked()) {
+            parkedZombie = true;
+            emit("上次老链路已驻留（持有页，状态已落盘）—— 请先重启设备，再开新一轮", 0);
+            return;
+        }
+        if (runLocked) {
+            emit("本次开机已启动过一轮 · 为防重复写入已锁定；要重开请点底部「重启手机」", 0);
+            return;
+        }
         long up = uptimeSec();
         long bid = bootId();                       /* 0 = 开机时长未知 */
         long lastBoot = getSharedPreferences("ownctl", MODE_PRIVATE).getLong("ran_boot", 0);
         boolean lastOk = getSharedPreferences("ownctl", MODE_PRIVATE)
                 .getBoolean("ran_boot_ok", false);
+        /* 门闩语义：同一次开机 + 已成功过 才拦；换了一次开机或上次没成功，一律放行重试 */
         if (bid != 0 && lastBoot == bid && lastOk) {
             long nowF = System.currentTimeMillis();
             if (nowF - forceRunAt > 3000) {
@@ -1840,8 +2272,12 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             }
             emit("已确认强行再跑一轮（风险自负）", 0);
         }
-        if (bid != 0) getSharedPreferences("ownctl", MODE_PRIVATE).edit()
-                .putLong("ran_boot", bid).apply();
+        if (bid != 0 && lastBoot != bid) {
+            /* 换了一次开机：上一次的 ok 不再代表这一次，先清零，成功时再置位 */
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putLong("ran_boot", bid)
+                    .putBoolean("ran_boot_ok", false).apply();
+        }
         if (verChoice().isEmpty()) {
             emit("请先在上方「链路版本」选择 3666 或 7879 —— 选错版本会在凭据阶段失败", 0);
             running = false;
@@ -1903,32 +2339,70 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                 }
             } catch (Throwable ignored) { }
         }
-        running = true;
-        synchronized (liveBuf) { liveBuf.setLength(0); }
-        startSession();
-        getSharedPreferences("ownctl", MODE_PRIVATE).edit().putInt("attempt", 0).apply();
-        for (int i = 0; i < 6; i++) pills[i].setBackgroundResource(R.drawable.pill_off);
-        stageIdx = 0;
-        progress.setText("进度 0 / 6");
-        badge.setText("运行中");
-        stage.setText("准备 · 释放链路文件");
-        startBreathe();
-        new Thread(new Runnable() {
-            public void run() {
-                try {
-                    if (Shizuku.pingBinder()
-                            && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED)
-                        runViaShizuku();
-                    else
-                        runViaSu();
-                } catch (Exception e) {
-                    emit("!! 启动异常：" + e, 0);
-                } finally {
-                    running = false;
-                    stopBreathe();
+        /* ---- 从这里开始「已开跑」，任何一步失败都必须把 running 退回去 ---- */
+        try {
+            running = true;
+            /* 点过启动就锁死按钮（落盘，按开机 id 生效）：本次开机不再允许第二轮 */
+            saveRunLock();
+            startLocked = true;
+            lockStartButton("已启动");
+            /* 每轮门闩全量复位：上一轮的 true 残留会让本轮完全静默（P0-2） */
+            runEnded = false;
+            runReader = null;
+            runStream = null;
+            sawSuccess = false;
+            successDeclared = false;
+            tailDropped = 0;
+            watchStop = false;
+            shownStage = 0;
+            parkedZombie = false;
+            stateTaken = false;
+            lastLineAt = System.currentTimeMillis();
+            synchronized (liveBuf) { liveBuf.setLength(0); }
+            liveWritten = 0;
+            liveHeader = false;
+            lastLiveFlush = 0;
+            startSession();
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit().putInt("attempt", 0).apply();
+            for (int i = 0; i < 6; i++) if (pills[i] != null)
+                pills[i].setBackgroundResource(R.drawable.pill_off);
+            stageIdx = 0;
+            progress.setText("进度 0 / 6");
+            badge.setText("运行中");
+            stage.setText("准备 · 释放链路文件");
+            startBreathe();
+            new Thread(new Runnable() {
+                public void run() {
+                    try {
+                        if (Shizuku.pingBinder()
+                                && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED)
+                            runViaShizuku();
+                        else
+                            runViaSu();
+                    } catch (Throwable e) {
+                        emit("!! 启动异常：" + e, 0);
+                    } finally {
+                        /* 统一出口：任何异常路径都不许把 running 留在 true */
+                        running = false;
+                        stopBreathe();
+                        if (!sawSuccess && !successDeclared) {
+                            markBootResult(false);
+                            ui.post(new Runnable() { public void run() {
+                                try {
+                                    badge.setText("已停止");
+                                    badge.setBackgroundResource(R.drawable.pill_off);
+                                    badge.setTextColor(0xFF7387A0);
+                                } catch (Throwable ignored) { }
+                            }});
+                        }
+                    }
                 }
-            }
-        }).start();
+            }).start();
+        } catch (Throwable t) {
+            running = false;
+            stopBreathe();
+            emit("!! 启动失败 · 已复位运行标志：" + t, 0);
+        }
     }
 
     private void runViaShizuku() throws Exception {
@@ -1979,12 +2453,25 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
             getSharedPreferences("ownctl", MODE_PRIVATE).edit()
                     .putBoolean("run_pending", true)
                     .putString("run_pending_ver", verChoice()).apply();
+            /* 2.9 会检查 KernelSU 管理器是否存在/版本；这里只提示，不自动安装 */
+            String ksu = ksuManagerInfo();
+            emit(ksu != null
+                    ? "· 提示 · KernelSU 管理器 " + ksu
+                    : "· 提示 · 未检测到 KernelSU 管理器（me.weishu.kernelsu）—— 接管成功后请自行安装，本 App 不代装", 0);
             emit("以 shell 身份启动链路（2.9 原版方式 · nofix）", 0);
-            legacyStart(svc, which, wantSha);
+            boolean gateOk = legacyStart(svc, which, wantSha);
             getSharedPreferences("ownctl", MODE_PRIVATE).edit()
                     .putBoolean("run_pending", false).apply();
-            String sp = saveLog("7879");
-            emit(sp != null ? "日志已保存 · " + sp : "日志保存失败", sp != null ? 1 : 0);
+            /* P1-1：7879 以前从不 finalize，日志永远停在「进行中」 */
+            if (sawSuccess && !successDeclared) declareSuccess();
+            markBootResult(sawSuccess);
+            String outcome = !gateOk ? "失败-载荷校验"
+                    : (sawSuccess ? "成功" : (parkedZombie ? "驻留" : "失败"));
+            /* A 成功 / B 驻留：不杀进程，只收尾；C 真失败：SIGTERM→复核→SIGKILL 彻底清理 */
+            endRun(outcome, "7879", gateOk ? 0 : 9,
+                    gateOk && !sawSuccess && !parkedZombie);
+            if ("驻留".equals(outcome))
+                emit("· 老链路已驻留 · 请重启设备；本状态已落盘，App 重启后仍会拦住启动", 0);
             return;
         }
         String cmd = "cd /data/local/tmp && rm -rf chan && mkdir -p chan"
@@ -2015,43 +2502,42 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                     if (idle > 45000) {
                         emit("· 卡住 · 已 " + (idle / 1000) + " 秒无输出 —— 清理本次链路进程", 0);
                         try { rpWatch.destroy(); } catch (Throwable ignored) { }
-                        // 未成功 = 还没拿到页，此时杀掉是安全的；成功路径在上面已 return
-                        try {
-                            if (svcRef != null) {
-                                IRemoteProcess k = svcRef.newProcess(
-                                        new String[]{"sh", "-c", "pkill -f own127"}, null, "/");
-                                k.waitFor();
-                            }
-                        } catch (Throwable ignored) { }
+                        /* 未成功 = 还没拿到页，此时杀是安全的（成功路径上面已 return）。
+                           用 PID 精确清理，不用 pkill -f（会自匹配到本进程的 sh -c）。 */
+                        try { killChainIfSafe(); } catch (Throwable ignored) { }
                         return;
                     }
                 }
             }
         }).start();
-        BufferedReader r = new BufferedReader(new InputStreamReader(is));
+        runStream = is;
+        runReader = new BufferedReader(new InputStreamReader(is));
+        final java.io.BufferedReader rr = runReader;
         String line;
-        while ((line = r.readLine()) != null) {
+        while ((line = rr.readLine()) != null) {
             lastLineAt = System.currentTimeMillis();
             narrate(line);
         }
-        watchStop = true;
-        int rc = rp.waitFor();
-        emit("· 收尾 · 链路进程已退出（code=" + rc + "）", 0);
-        {
-            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
-                    .putBoolean("run_pending", false).apply();
-            String sp2 = saveLog(verChoice());
-            emit(sp2 != null ? "日志已保存 · " + sp2 : "日志保存失败", sp2 != null ? 1 : 0);
+        /* 成功/驻留路径上 declareSuccess 已经收过尾（runEnded=true），这里只补没结束的情况 */
+        int rc = -1;
+        if (!runEnded) {
+            watchStop = true;
+            try { rc = rp.waitFor(); } catch (Throwable ignored) { }
+            emit("· 收尾 · 链路进程已退出（code=" + rc + "）", 0);
+        } else {
+            emit("· 读句柄已由收尾关闭（成功/驻留路径）", 0);
         }
+        getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                .putBoolean("run_pending", false).apply();
         if (sawSuccess && !successDeclared) declareSuccess();
-        else emit("· 结束 · 本次未接管内核", 0);
-        {
-            String fin = finishSession(parkedZombie ? "驻留"
-                    : (sawSuccess ? "成功" : ("失败-code" + rc)));
-            emit(fin != null ? "本轮日志文件 · " + fin : "本轮日志改名失败", fin != null ? 1 : 0);
-        }   // 全部跑完才显示成功
+        else if (!runEnded) emit("· 结束 · 本次未接管内核", 0);
+        markBootResult(sawSuccess);
+        /* 3666 也走统一收尾：成功不杀（pause 保活），失败/超时才清理进程 */
+        String outcome3666 = sawSuccess ? "成功" : (parkedZombie ? "驻留" : ("失败-code" + rc));
+        endRun(outcome3666, verChoice().isEmpty() ? "unknown" : verChoice(), rc,
+                !sawSuccess && !parkedZombie);
         emit("§ 链路退出 code=" + rc, 0);
-        boolean live = false;
+        boolean live = sawSuccess || stateTaken;
         for (int i = 0; i < 20 && !live; i++) {
             live = moduleLoaded();
             if (!live) try { Thread.sleep(500); } catch (InterruptedException ignored) { }
@@ -2134,7 +2620,12 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
                 new java.io.InputStreamReader(p.getInputStream()));
         String line;
         while ((line = r.readLine()) != null) narrate(line);
-        emit("§ 链路退出 code=" + p.waitFor(), 0);
+        int rc = p.waitFor();
+        emit("§ 链路退出 code=" + rc, 0);
+        /* su 回退路径同样要收尾，否则又留一个「进行中」（P1-1 同类问题） */
+        markBootResult(false);
+        String fin = finishSession("失败-su" + rc);
+        emit(fin != null ? "本轮日志文件 · " + fin : "本轮日志改名失败", fin != null ? 1 : 0);
     }
 
     private void unpack(String asset, File dst) throws Exception {
@@ -2148,12 +2639,217 @@ public class MainActivity extends Activity implements Shizuku.OnRequestPermissio
         dst.setExecutable(true, false);
     }
 
-    private void stop() {
+    /* ================= 统一收尾（两条链路都走这里） ================= */
+    private final Object runLock = new Object();
+    /** 本轮是否已经收尾（幂等闸门，防止 declareSuccess 与读线程各收一次）. */
+    private volatile boolean runEnded;
+    /** 本轮持有的本地流与读句柄：收尾时必须关掉，否则 fd 泄漏。 */
+    private volatile java.io.BufferedReader runReader;
+    private volatile InputStream runStream;
+
+    /** 只关本地 fd 与读句柄；绝不 destroy 远端进程（成功/驻留时 destroy 会杀掉持有页的载荷）。 */
+    private void closeLocalStreams() {
+        try { if (runReader != null) runReader.close(); } catch (Throwable ignored) { }
+        runReader = null;
+        try { if (runStream != null) runStream.close(); } catch (Throwable ignored) { }
+        runStream = null;
+    }
+
+    private void shQuiet(String cmd) {
         try {
-            if (rp != null) rp.destroy();
+            IShizukuService s = svcRef;
+            if (s == null) {
+                if (!Shizuku.pingBinder()) return;
+                s = IShizukuService.Stub.asInterface(new ShizukuBinderWrapper(Shizuku.getBinder()));
+            }
+            IRemoteProcess p = s.newProcess(new String[]{"sh", "-c", cmd}, null, "/");
+            p.waitFor();
+        } catch (Throwable ignored) { }
+    }
+
+    /** pidof own127 的原始输出（可能多 pid，空串=没有）。 */
+    private String remotePids() {
+        try {
+            IShizukuService s = svcRef;
+            if (s == null) {
+                if (!Shizuku.pingBinder()) return "";
+                s = IShizukuService.Stub.asInterface(new ShizukuBinderWrapper(Shizuku.getBinder()));
+            }
+            IRemoteProcess p = s.newProcess(new String[]{"sh", "-c",
+                    "pidof own127 2>/dev/null || echo"}, null, "/");
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(
+                    new android.os.ParcelFileDescriptor.AutoCloseInputStream(p.getInputStream())));
+            String v = r.readLine();
+            r.close();
+            p.waitFor();
+            return v == null ? "" : v.trim();
+        } catch (Throwable t) { return ""; }
+    }
+
+    /**
+     * 失败路径清理：pidof own127 取真实 PID → kill -TERM → 1.5s 复核 → 仍在则 kill -9。
+     * 用 PID 而不是 `pkill -f`：pkill 的 -f 会匹配到执行它的那条 sh -c（自匹配），
+     * 信号还没发完就把自己打断，复核也就拿不到真实结果；PID 精确、不自伤。
+     * 成功 / 驻留 / 内核已接管 一律拒绝（此时载荷持有页，杀掉会 UAF）。
+     */
+    private boolean killChainIfSafe() {
+        if (sawSuccess || successDeclared || parkedZombie) {
+            emit("· 已成功/已驻留 · 拒绝清理进程（杀了会引起 UAF）", 0);
+            return false;
+        }
+        boolean mod = false;
+        try { mod = moduleLoaded(); } catch (Throwable ignored) { }
+        if (mod) { emit("· 内核已接管 · 拒绝清理进程", 0); return false; }
+        String pids = remotePids();
+        if (pids == null || pids.isEmpty()) {
+            emit("· 清理复核：pidof own127 为空（本轮没有留下进程）", 1);
+            return true;
+        }
+        /* 1) SIGTERM，精确到 pid */
+        shQuiet("kill -TERM " + pids + " 2>/dev/null; true");
+        try { Thread.sleep(1500); } catch (InterruptedException ignored) { }
+        String alive = remotePids();
+        /* 2) 复核：还在就 SIGKILL */
+        if (alive != null && !alive.isEmpty()) {
+            emit("· 清理复核：仍有 pid " + alive + " · 补发 SIGKILL", 0);
+            shQuiet("kill -9 " + alive + " 2>/dev/null; true");
+            try { Thread.sleep(800); } catch (InterruptedException ignored) { }
+            alive = remotePids();
+        }
+        boolean clean = alive == null || alive.isEmpty();
+        emit(clean ? "· 进程已清理（pidof own127 为空）"
+                   : "· 进程仍在：" + alive + "（已两次发信号）", clean ? 1 : 0);
+        return clean;
+    }
+
+    /**
+     * 唯一收尾入口：关流 → 停看门狗 →（失败才清理进程）→ 复位 running → 命名会话 → 保存日志。
+     * outcome 取 "成功" / "驻留" / "失败…"；killIfFailed=false 时绝不动进程。
+     */
+    /** 2.9 的兜底成功判据：grep -i kernelsu /proc/modules 有输出即视为接管成功。 */
+    private boolean legacyFallbackOk() {
+        try {
+            if (!Shizuku.pingBinder()) return moduleLoaded();
+            IShizukuService svc0 = IShizukuService.Stub.asInterface(
+                    new ShizukuBinderWrapper(Shizuku.getBinder()));
+            String out = shellText(svc0, "grep -ic kernelsu /proc/modules 2>/dev/null");
+            return out != null && !out.trim().isEmpty() && !"0".equals(out.trim());
+        } catch (Throwable t) {
+            return moduleLoaded();
+        }
+    }
+
+    private void endRun(String outcome, String logTag, int rc, boolean killIfFailed) {
+        // 2.9 兜底：日志没抓到 SUCCESS、但 /proc/modules 已有 kernelsu → 仍按成功收尾
+        if ("7879".equals(verChoice()) && !sawSuccess && legacyFallbackOk()) {
+            sawSuccess = true;
+            legacyFailed = false;
+            emit("· 2.9 兜底判据命中 · /proc/modules 里已有 kernelsu", 1);
+            if ("失败".equals(outcome)) outcome = "成功";
+            killIfFailed = false;
+        }
+        synchronized (runLock) {
+            if (runEnded) return;
+            runEnded = true;
+        }
+        closeLocalStreams();                 /* 1) 关流（只关本地 fd） */
+        watchStop = true;                    /* 2) 停看门狗 */
+        boolean clean = true;
+        if (killIfFailed) clean = killChainIfSafe();   /* 3) 失败才清理 */
+        running = false;                     /* 4) 复位运行态 */
+        stopBreathe();
+        String fin = finishSession(outcome); /* 5) 命名会话 */
+        String sp = saveLog(logTag);         /* 6) 保存日志 */
+        if ("驻留".equals(outcome)) saveParked(true);
+        final String finF = fin, spF = sp;
+        final boolean cleanF = clean;
+        ui.post(new Runnable() {
+            public void run() {
+                try {
+                    if (stateTaken || successDeclared || sawSuccess) {
+                        applyUiTaken("已接管 · 已驻留保活，无需再启动");
+                    } else {
+                        badge.setText("已结束");
+                        badge.setBackgroundResource(R.drawable.pill_off);
+                        badge.setTextColor(0xFF7387A0);
+                        progress.setText("进度 0 / 6");
+                        lockStartButton("已启动过");
+                    }
+                } catch (Throwable ignored) { }
+                if (finF != null) emit("本轮日志文件 · " + finF, 1);
+                else emit("本轮日志改名失败", 0);
+                if (spF != null) emit("日志已保存 · " + spF, 1);
+            }
+        });
+        /* 7) 一行结论 */
+        if ("成功".equals(outcome))
+            emit("· 收尾完成 · 已驻留勿杀（pause，CPU≈0 / RSS<1MB）—— 要重开窗口请重启设备", 1);
+        else if ("驻留".equals(outcome))
+            emit("· 收尾完成 · 老链路已驻留，请重启设备；本状态已落盘，App 重启后仍会拦住启动", 0);
+        else
+            emit("本轮已结束 · " + (killIfFailed
+                    ? (clean ? "进程已清理 · 可重启后再试" : "进程未能清理 · 请重启设备")
+                    : "无需清理 · 可重启后再试"), killIfFailed && clean ? 1 : 0);
+    }
+
+    /** 驻留状态落盘：重启 App 后仍拦住「启动链路」；换了一次开机自动失效。 */
+    private void saveParked(boolean parked) {
+        try {
+            long bid = bootId();
+            getSharedPreferences("ownctl", MODE_PRIVATE).edit()
+                    .putBoolean("parked", parked)
+                    .putLong("parked_boot", bid).apply();
+        } catch (Throwable ignored) { }
+    }
+
+    private boolean loadParked() {
+        try {
+            long bid = bootId();
+            if (bid == 0) return false;
+            return getSharedPreferences("ownctl", MODE_PRIVATE).getBoolean("parked", false)
+                    && getSharedPreferences("ownctl", MODE_PRIVATE).getLong("parked_boot", 0) == bid;
+        } catch (Throwable t) { return false; }
+    }
+
+    /** 用户直接划掉 App（onDestroy）时兜底：仍在跑且未成功 → 按失败路径清理。 */
+    private void cleanupOnLeave() {
+        if (!running || runEnded) return;
+        if (sawSuccess || successDeclared || parkedZombie) return;
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    boolean mod = moduleLoaded();
+                    if (mod) { running = false; return; }   /* 已接管：绝不动进程 */
+                    endRun("失败-离开界面", verChoice(), -1, true);
+                } catch (Throwable ignored) { }
+            }
+        }).start();
+    }
+
+    private void stop() {
+        boolean killed = false;
+        try {
+            if (rp != null) { rp.destroy(); killed = true; }
         } catch (Exception ignored) { }
-        emit("已中止链路 · 进程已回收", 0);
+        watchStop = true;              /* 3666 的看门狗线程读这个标志 */
+        if (killed) emit("已中止链路 · 进程已回收", 0);
+        else if ("7879".equals(verChoice()))
+            /* 按硬约束：7879 的观察循环不改行为（不加提前退出），这里只说事实，不假称已回收 */
+            emit("已标记中止 · 7879 走 setsid、无进程句柄可回收；观察按 2.9 原版继续到上限，内核写路径不受影响", 0);
+        else emit("已中止 · 没有可回收的进程句柄", 0);
         running = false;
         stopBreathe();
+        /* 跑过就还是锁着的：本次开机不允许再点第二轮 */
+        startLocked = true;
+        if (!stateTaken) {
+            ui.post(new Runnable() { public void run() {
+                try {
+                    badge.setText("已停止");
+                    badge.setBackgroundResource(R.drawable.pill_off);
+                    badge.setTextColor(0xFF7387A0);
+                    lockStartButton("已启动过");
+                } catch (Throwable ignored) { }
+            }});
+        }
     }
 }

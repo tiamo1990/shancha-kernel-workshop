@@ -118,7 +118,7 @@ APK 信息：
 
 ## 下载
 
-- **安装包**：``release/shancha-提权-v7.6.apk`（正式版命名规范：`shancha-提权-vX.X`）
+- **安装包**：``release/shancha-提权-v8.1.apk`（正式版命名规范：`shancha-提权-vX.X`）
 - **Release 页**：[v5.5](https://github.com/tiamo1990/shancha-kernel-workshop/releases/tag/v5.5)（附件为 ASCII 别名 `shancha-v5.5.apk`，内容一致）
 - **源码**：[src/](src/)（载荷 `own137.c` + App Java 源码）
 - **历史研究记录**：[research/](research/)（项目报告、各阶段脚本、早期 `own127.c`）
@@ -140,7 +140,7 @@ APK 信息：
 
 ### 下载
 
-- 仓库内：`release/shancha-提权-v7.6.apk`
+- 仓库内：`release/shancha-提权-v8.1.apk`
 - Release 附件：`shancha-v6.9.apk`（ASCII 别名，字节一致）
 ---
 
@@ -202,3 +202,49 @@ setsid /data/local/tmp/own127 fake nofix > own127.log 2>&1 < /dev/null &
 - sha256 门禁大小写归一；内核与所选不一致仅警告
 - 成功后「中止」拒绝、「重启」需 4 秒内双击；超窗（>150 s）需二次确认
 - 卡住（未成功且 45 s 无输出）自动清理链路进程
+---
+
+## v8.0 → v8.1（versionCode 96 → 97）大修
+
+依据 `docs/APK_AUDIT.md`（体检 39 条）完成 App 层大修。
+
+### P0 修复
+
+| 项 | 内容 |
+|---|---|
+| 状态回填 | 冷启动/回前台按 `moduleLoaded()` + `pidof own127` 显示真实态：已接管 → 徽标「已接管」、进度 6/6、启动键置灰 |
+| `running` 复位 | `start()` 内外双层 try/catch + 线程 finally + 崩溃守卫，异常路径不再卡死 |
+| 开机门闩 | `ran_boot_ok` 按 bootId 判定，仅“本次开机真成功过”才拦（`markBootResult`） |
+| 前台服务 type | `foregroundServiceType="specialUse"` + 权限 + subtype 属性，Android 14+ 不再崩 |
+| 7879 sha 门禁 | 校验独立执行、跑在 `setsid` **之前**，不进启动链；不一致 `exit 9` |
+
+### 收尾统一（`endRun`）
+
+```
+关流 → 停看门狗 → 失败才清理 → 复位 running → 命名会话 → 保存日志
+```
+
+7879 三种结局：
+- 成功：**不杀**（持页），`finishSession("成功")`，提示勿杀
+- 驻留（`parking without reap`）：**不杀**，状态落盘，重启 App 后仍拦启动
+- 真失败：`pidof` → `kill -TERM` → 1.5 s 复核 → `kill -9` 兜底
+
+### 7879 成功判据（对齐 v2.9）
+
+v2.9 只有两条判据：
+1. 日志出现 `[gate127] SUCCESS`
+2. 兜底：`grep -ic kernelsu /proc/modules` 非 0
+
+v8.1 按此实现，并在兜底命中时把 `killIfFailed` 置 false（避免“成功了却把进程杀掉”）。
+
+### 其它
+
+- 日志：每轮独立文件、1 s 刷新、结束按 `成功/失败-codeN/驻留/重启` 改名；杜绝全 0 文件
+- 点过启动即锁按钮（按 bootId 落盘），防止重复跑
+- 清理改用 PID 精确 kill（`pkill -f own127` 会自匹配到自己那条 sh -c）
+- 移除多余 `WRITE_EXTERNAL_STORAGE`
+
+### 已知风险（未解决）
+
+- 3666 的 `fix_rc_uid` 写路径仍为概率性内核 panic
+- 7879 失败场景的清理链路尚未真机验证

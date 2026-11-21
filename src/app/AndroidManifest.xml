@@ -1,14 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.shancha.ownctl"
-    android:versionCode="63"
-    android:versionName="5.5">
+    android:versionCode="97"
+    android:versionName="8.1">
 
     <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="34" />
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- targetSdk 34 起：specialUse 必须单独声明这条权限，否则 startForeground 直接抛 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 日志全部走 MediaStore(Downloads)，不再需要 WRITE_EXTERNAL_STORAGE（P3-1） -->
 
     <application
         android:label="@string/app_name"
@@ -39,9 +43,16 @@
             </intent-filter>
         </receiver>
 
+        <!-- P0-4：targetSdk 34 下 startForeground 必须带合法 type，否则
+             MissingForegroundServiceTypeException 立即崩。这里声明 specialUse。 -->
         <service
             android:name=".ChainService"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="boot_time_kernel_chain_handoff" />
+        </service>
 
         <activity
             android:name=".OnboardActivity"

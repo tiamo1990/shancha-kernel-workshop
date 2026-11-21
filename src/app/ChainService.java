@@ -25,7 +25,36 @@ public class ChainService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(1, note("链路准备中 · 等待 Shizuku"));
+        /* P0-4：targetSdk 34 起 startForeground 不带 type 会抛
+           MissingForegroundServiceTypeException，服务起来就崩。
+           manifest 已声明 specialUse，这里显式传同一个 type；
+           万一 OEM 仍拒绝，也只降级提示，不让服务崩掉。 */
+        boolean fgOk = false;
+        try {
+            Notification n = note("链路准备中 · 等待 Shizuku");
+            if (android.os.Build.VERSION.SDK_INT >= 34) {
+                startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else {
+                startForeground(1, n);
+            }
+            fgOk = true;
+            android.util.Log.i("ownctl", "FGS_OK type=specialUse sdk=" + android.os.Build.VERSION.SDK_INT);
+        } catch (Throwable t) {
+            android.util.Log.e("ownctl", "FGS_FAIL " + t, t);
+            try { upd("前台服务降级：" + t.getClass().getSimpleName()); } catch (Throwable ignored) { }
+        }
+        /* 自检通道：MainActivity 用 probe_fgs 拉起本服务，只验证 FGS type 合法，
+           绝不碰载荷（payload 链路只由 auto_run 或用户点「启动链路」触发）。 */
+        final boolean probe = intent != null && intent.getBooleanExtra("probe", false);
+        if (probe) {
+            final String msg = fgOk ? "FGS_PROBE_OK type=specialUse" : "FGS_PROBE_FAIL";
+            android.util.Log.i("ownctl", msg);
+            upd(msg);
+            new android.os.Handler(getMainLooper()).postDelayed(new Runnable() {
+                public void run() { stopSelf(); }
+            }, 9000);
+            return START_NOT_STICKY;
+        }
         new Thread(new Runnable() {
             public void run() {
                 try {
