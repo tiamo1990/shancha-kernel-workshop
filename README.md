@@ -118,7 +118,27 @@ APK 信息：
 
 ## 下载
 
-- **安装包**：`release/shancha-提权-v5.5.apk`（正式版命名 `shancha-提权-vX.X`）
+- **安装包**：``release/shancha-提权-v6.9.apk`（正式版命名规范：`shancha-提权-vX.X`）
 - **Release 页**：[v5.5](https://github.com/tiamo1990/shancha-kernel-workshop/releases/tag/v5.5)（附件为 ASCII 别名 `shancha-v5.5.apk`，内容一致）
 - **源码**：[src/](src/)（载荷 `own137.c` + App Java 源码）
 - **历史研究记录**：[research/](research/)（项目报告、各阶段脚本、早期 `own127.c`）
+---
+
+## v6.9 更新要点（versionCode 77）
+
+| 项 | 说明 |
+|---|---|
+| 双版本必选 | 3666（新内核）/ 7879（旧内核）；界面提示「7879 实测 7946、6638 也可用；3666 未知，可自行测试」 |
+| 选择 = 载荷 | `assets/payloads.json` 外置清单；选择直接决定资产，不再经过自动匹配 |
+| sha256 门禁 | 运行前校验，**大小写归一**；不符才阻止执行 |
+| 内核不符 | 仅警告「已放行」，仍按所选执行 |
+| 7879 日志 | 2.9 原版原样输出，不格式化，只按关键词着色 |
+| 成功即停手 | 成功后停止一切内核写，`pause()` 保活，实测 CPU 0% |
+| 误触保护 | 成功「中止」拒绝；「重启」需 4 秒内双击确认 |
+| 失败可重试 | 同一次开机内允许再试；成功后需双击才能强行再跑 |
+| 日志导出 | 长按「复制」→ `/sdcard/Download/shancha-log-<时间>.txt` |
+
+### 下载
+
+- 仓库内：`release/shancha-提权-v6.9.apk`
+- Release 附件：`shancha-v6.9.apk`（ASCII 别名，字节一致）

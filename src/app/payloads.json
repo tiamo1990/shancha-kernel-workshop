@@ -1,0 +1,20 @@
+{
+  "payloads": [
+    {
+      "id": "3666",
+      "asset": "own127",
+      "size": 532216,
+      "sha256": "EA79A8ED3EAD0DB8BF9B448AA1A2E33C89CB7D3C99C740942F5B3C5FF0B86175",
+      "label": "3666 · 新内核",
+      "kernel": "6.6.127 / abogki573773666"
+    },
+    {
+      "id": "7879",
+      "asset": "own127_prev",
+      "size": 527672,
+      "sha256": "EA78013468BD0C8FCCF5CEDB030A08D9162D450757288EE5CAC15185B75B43D2",
+      "label": "7879 · 旧内核",
+      "kernel": "6.6.127 / abogki…7879 · 实测 7946、6638 也可用"
+    }
+  ]
+}
